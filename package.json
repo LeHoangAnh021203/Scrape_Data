@@ -10,7 +10,8 @@
     "count-db": "node check-db.js count",
     "api": "node api-server.js",
     "api:dev": "nodemon api-server.js",
-    "api:dev:heap": "NODE_OPTIONS=\"--max-old-space-size=4096\" nodemon api-server.js"
+    "api:dev:heap": "NODE_OPTIONS=\"--max-old-space-size=4096\" nodemon api-server.js",
+    "postinstall": "npx puppeteer@22 browsers install chrome"
   },
   "dependencies": {
     "axios": "^1.7.0",
