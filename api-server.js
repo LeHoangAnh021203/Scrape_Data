@@ -249,6 +249,12 @@ const parseRangeDateString = (value) => {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 };
 
+const parseRangeDateValue = (value) => {
+  if (!value) return null;
+  if (value instanceof Date) return value;
+  return parseRangeDateString(value);
+};
+
 const padNumber = (num) => String(num).padStart(2, '0');
 
 const timezoneFormatterCache = new Map();
@@ -421,27 +427,42 @@ const formatDateTime = (date) => {
 
 const rangeKey = (rangeStart, rangeEnd) => `range:${rangeStart || 'none'}:${rangeEnd || 'none'}`;
 
-const buildRangeQuery = (rangeStart, rangeEnd) => {
+const buildRangeQuery = (rangeStart, rangeEnd, field = 'scrapedAt') => {
   if (!rangeStart || !rangeEnd) return null;
-  const range = { $gte: rangeStart, $lte: rangeEnd };
-  return { crt_time: range };
+  const start = parseRangeDateValue(rangeStart);
+  const end = parseRangeDateValue(rangeEnd);
+  if (!start || !end) return null;
+  return { [field]: { $gte: start, $lte: end } };
 };
 
 const buildTimeFieldQuery = (field, rangeFilter) => {
-  const parts = [{ [field]: { $gt: '' } }];
-  if (rangeFilter) parts.unshift(rangeFilter);
+  const parts = [];
+  if (rangeFilter) {
+    parts.push(rangeFilter);
+  }
+  if (field === 'crt_time') {
+    parts.push({ [field]: { $gt: '' } });
+  } else {
+    parts.push({ [field]: { $exists: true } });
+  }
   return parts.length === 1 ? parts[0] : { $and: parts };
 };
 
-const getDataTimeRange = async (rangeFilter = null, field = 'crt_time') => {
+const toRangeFieldValue = (value) => {
+  if (!value) return null;
+  if (value instanceof Date) return value.toISOString();
+  return value;
+};
+
+const getDataTimeRange = async (rangeFilter = null, field = 'scrapedAt') => {
   const query = buildTimeFieldQuery(field, rangeFilter);
   const [oldest, newest] = await Promise.all([
     Skin.findOne(query).sort({ [field]: 1 }).lean(),
     Skin.findOne(query).sort({ [field]: -1 }).lean()
   ]);
   return {
-    from: oldest ? oldest[field] : null,
-    to: newest ? newest[field] : null
+    from: oldest ? toRangeFieldValue(oldest[field]) : null,
+    to: newest ? toRangeFieldValue(newest[field]) : null
   };
 };
 
