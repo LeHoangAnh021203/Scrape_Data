@@ -28,6 +28,7 @@ if (envExecPath) {
     resolvedExecPath = undefined;
   }
 }
+console.log('puppeteer exec path env=', envExecPath, 'default=', defaultExecPath, 'resolved=', resolvedExecPath);
 
 export const cfg = {
   targetUrl: process.env.TARGET_URL || 'https://zm.bitmoji-zmlh.com/skinmgr/#/skinmgr/recordsList',
