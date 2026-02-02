@@ -29,6 +29,11 @@ if (envExecPath) {
   }
 }
 console.log('puppeteer exec path env=', envExecPath, 'default=', defaultExecPath, 'resolved=', resolvedExecPath);
+if (resolvedExecPath) {
+  console.log('exec path exists?', fs.existsSync(resolvedExecPath));
+} else {
+  console.log('exec path exists? no path resolved');
+}
 
 export const cfg = {
   targetUrl: process.env.TARGET_URL || 'https://zm.bitmoji-zmlh.com/skinmgr/#/skinmgr/recordsList',
