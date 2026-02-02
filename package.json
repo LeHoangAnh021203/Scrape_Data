@@ -11,7 +11,7 @@
     "api": "node api-server.js",
     "api:dev": "nodemon api-server.js",
     "api:dev:heap": "NODE_OPTIONS=\"--max-old-space-size=4096\" nodemon api-server.js",
-    "postinstall": "npx puppeteer@22 browsers install chrome && ./scripts/link-chrome.sh"
+    "postinstall": "npx puppeteer@22 browsers install chrome && ./scripts/link-chrome.sh && node scripts/check-chrome.js"
   },
   "dependencies": {
     "axios": "^1.7.0",
