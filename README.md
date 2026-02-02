@@ -108,9 +108,7 @@ bitmoji-scraper/
   - `buildRangeQuery` tự xét `rangeField=crt_time` là string nên dùng `st`/`ed` raw, còn `rangeField=scrapedAt` dùng Date/bộ lọc bình thường; cả hai đều đã có index.  
   - Nếu không truyền `rangeField`, endpoint sẽ cố gắng lọc theo `scrapedAt` trước rồi fallback sang `crt_time` nếu range đó trả về 0 bản ghi.
 - ### Render deployment
-- Sau khi Render chạy `npm install`, script `postinstall` sẽ cài Puppeteer và rồi gọi `scripts/link-chrome.sh` để đảm bảo `/opt/render/.cache/puppeteer/bin/chrome` trỏ tới Chrome thật. Nếu bạn đổi version Chrome vào tương lai, chỉ cần cập nhật đường dẫn trong `scripts/link-chrome.sh`.  
-  - `buildRangeQuery` tự xét `rangeField=crt_time` là string nên dùng `st`/`ed` raw thay vì convert sang Date, vì `crt_time` lưu dưới dạng chuỗi.  
-  - Nếu không truyền `rangeField`, endpoint sẽ cố gắng lọc theo `scrapedAt` trước rồi fallback sang `crt_time` nếu range đó trả về 0 bản ghi.
+- Sau khi Render chạy `npm install`, script `postinstall` sẽ cài Puppeteer và gọi `scripts/link-chrome.sh` để chmod Chrome, tạo symlink `/opt/render/.cache/puppeteer/bin/chrome` và in log đường dẫn; nếu đổi version Chrome thì chỉ cần cập nhật đường dẫn trong script trước khi redeploy.  
 
 ## Legal Notice
 
