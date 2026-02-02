@@ -8,6 +8,7 @@ export async function extractAllPages(page, options = {}) {
   const seenKeys = new Set();
   let apiConfig = null;
   let apiMeta = null;
+  let firstListLength = null;
   const clearDateFilters = options.clearDateFilters ??
     String(process.env.CLEAR_DATE_FILTERS || 'false') === 'true';
   const debugApiRequests = options.debugApiRequests ??
@@ -417,6 +418,9 @@ export async function extractAllPages(page, options = {}) {
             },
             payload: applyForcedDateRange(sanitizePayload(parsedPayload))
           };
+          if (Array.isArray(list) && firstListLength == null) {
+            firstListLength = list.length;
+          }
           if (debugApiRequests) {
             console.log('🧾 API request URL:', apiConfig.url);
             console.log('🧾 API request method:', apiConfig.method);
@@ -590,16 +594,18 @@ export async function extractAllPages(page, options = {}) {
     const effectivePageKey = pageKey || 'page';
     const effectiveSizeKey = sizeKey || 'pageSize';
 
+    let needSequentialFetch = false;
+    let fallbackPageSize = null;
     let total = apiMeta.total ?? null;
     let pageSize = forcePageSize || (apiMeta.pageSize ?? (sizeKey ? Number(apiConfig.payload?.[sizeKey]) : null));
     const currentPage = apiMeta.pageNum ?? (pageKey ? Number(apiConfig.payload?.[pageKey]) : 1);
-
     if (!total || !pageSize) {
-      console.log('⚠️  Thiếu total/pageSize từ API. Trả về dữ liệu đã thu thập.');
-      return collectedData;
+      fallbackPageSize = forcePageSize || firstListLength || apiMeta?.pageSize || 10;
+      console.log('⚠️  Thiếu total/pageSize từ API. Fallback sang sequential fetch.');
+      pageSize = fallbackPageSize;
+      needSequentialFetch = true;
     }
-
-    let totalPages = Math.ceil(total / pageSize);
+    let totalPages = total && pageSize ? Math.ceil(total / pageSize) : 0;
 
   let contentType = apiConfig.headers?.['content-type'] || 'application/json';
   const allowedHeaderKeys = [
@@ -632,7 +638,7 @@ export async function extractAllPages(page, options = {}) {
       basePayload[effectiveSizeKey] = forcePageSize;
     }
 
-  const fetchPageRaw = async (pageNum, payloadOverride) => {
+    const fetchPageRaw = async (pageNum, payloadOverride) => {
     if (!apiConfig || !apiConfig.url) {
         return {
           list: [],
@@ -1001,6 +1007,32 @@ export async function extractAllPages(page, options = {}) {
         };
       }
     };
+
+    const fetchSequentialPages = async (pageSizeFallback) => {
+      if (!pageSizeFallback) pageSizeFallback = forcePageSize || firstListLength || 10;
+      let pageNum = 1;
+      let consecutiveEmpty = 0;
+      while (consecutiveEmpty < emptyPageStop) {
+        const pageResult = await fetchPageRaw(pageNum, { [effectiveSizeKey]: pageSizeFallback });
+        const list = Array.isArray(pageResult.list) ? pageResult.list : [];
+        if (list.length === 0) {
+          consecutiveEmpty += 1;
+          await delay(pageDelayMs);
+        } else {
+          consecutiveEmpty = 0;
+          for (const item of list) pushUnique(item);
+          if (list.length < pageSizeFallback) {
+            break;
+          }
+        }
+        pageNum += 1;
+      }
+    };
+
+    if (needSequentialFetch) {
+      await fetchSequentialPages(fallbackPageSize);
+      return collectedData;
+    }
 
     if (chunkDateRange) {
       const startDate = parseDateTime(chunkDateStart);

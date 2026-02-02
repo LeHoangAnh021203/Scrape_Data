@@ -257,6 +257,30 @@ const parseRangeDateValue = (value) => {
 
 const padNumber = (num) => String(num).padStart(2, '0');
 
+const formatRangeBoundary = (date) => {
+  if (!date) return null;
+  return `${date.getFullYear()}-${padNumber(date.getMonth() + 1)}-${padNumber(date.getDate())} `
+    + `${padNumber(date.getHours())}:${padNumber(date.getMinutes())}`;
+};
+
+const getLatestMonthRange = async (field) => {
+  const latest = await Skin.findOne({ [field]: { $exists: true, $ne: '' } })
+    .sort({ [field]: -1 })
+    .lean();
+  if (!latest) return null;
+  const rawValue = latest[field];
+  const parsed = parseRangeDateValue(rawValue);
+  if (!parsed) return null;
+  const year = parsed.getFullYear();
+  const month = parsed.getMonth();
+  const start = new Date(year, month, 1, 0, 0, 0, 0);
+  const end = new Date(year, month + 1, 0, 23, 59, 0, 0);
+  return {
+    start: formatRangeBoundary(start),
+    end: formatRangeBoundary(end)
+  };
+};
+
 const timezoneFormatterCache = new Map();
 
 const getTimezoneFormatter = (timezone) => {
@@ -429,6 +453,9 @@ const rangeKey = (rangeStart, rangeEnd) => `range:${rangeStart || 'none'}:${rang
 
 const buildRangeQuery = (rangeStart, rangeEnd, field = 'scrapedAt') => {
   if (!rangeStart || !rangeEnd) return null;
+  if (field === 'crt_time') {
+    return { [field]: { $gte: rangeStart, $lte: rangeEnd } };
+  }
   const start = parseRangeDateValue(rangeStart);
   const end = parseRangeDateValue(rangeEnd);
   if (!start || !end) return null;
@@ -832,8 +859,8 @@ app.get('/api/sync/status', async (req, res) => {
   try {
     const inputStart = req.query.start ?? req.query.from ?? null;
     const inputEnd = req.query.end ?? req.query.to ?? null;
-    const rangeStart = normalizeDateInput(inputStart, false);
-    const rangeEnd = normalizeDateInput(inputEnd, true);
+    let rangeStart = normalizeDateInput(inputStart, false);
+    let rangeEnd = normalizeDateInput(inputEnd, true);
     let syncState = null;
     if (rangeStart && rangeEnd) {
       syncState = await SyncState.findOne({ key: rangeKey(rangeStart, rangeEnd) }).lean();
@@ -879,15 +906,17 @@ app.post('/api/sync/request', async (req, res) => {
  */
 app.get('/api/data', async (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = Math.min(parseInt(req.query.limit) || 50, 500);
-    const skip = (page - 1) * limit;
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+    const parsedLimit = Number.isNaN(Number(req.query.limit)) ? null : Number(req.query.limit);
+    const noLimitFlag = String(req.query.noLimit ?? req.query.unlimited ?? 'false').toLowerCase() === 'true';
+    const unlimitedRequest = noLimitFlag || (parsedLimit !== null && parsedLimit <= 0);
+    const resolvedLimit = unlimitedRequest ? null : Math.min(parsedLimit ?? 50, 500);
+    const skip = unlimitedRequest ? 0 : (page - 1) * resolvedLimit;
     const search = req.query.search || '';
     const sortBy = req.query.sortBy || 'scrapedAt';
     const sortOrder = req.query.sortOrder === 'asc' ? 1 : -1;
     const inputStart = req.query.start ?? req.query.from ?? null;
     const inputEnd = req.query.end ?? req.query.to ?? null;
-    const refresh = String(req.query.refresh ?? 'false') === 'true';
     const rangeStart = normalizeDateInput(inputStart, false);
     const rangeEnd = normalizeDateInput(inputEnd, true);
     const headerToken =
@@ -905,7 +934,10 @@ app.get('/api/data', async (req, res) => {
       bearerToken ||
       headerToken ||
       '';
-    const rangeFilter = buildRangeQuery(rangeStart, rangeEnd);
+    const rangeField = (req.query.rangeField || req.query.field || 'scrapedAt').trim();
+    const allowedFields = ['scrapedAt', 'crt_time'];
+    const normalizedRangeField = allowedFields.includes(rangeField) ? rangeField : 'scrapedAt';
+    const rangeFilter = buildRangeQuery(rangeStart, rangeEnd, normalizedRangeField);
 
     // Build query
     const queryParts = [];
@@ -928,11 +960,11 @@ app.get('/api/data', async (req, res) => {
     const total = await Skin.countDocuments(query);
 
     // Get data
-    const data = await Skin.find(query)
-      .sort({ [sortBy]: sortOrder })
-      .skip(skip)
-      .limit(limit)
-      .lean();
+    let dataQuery = Skin.find(query).sort({ [sortBy]: sortOrder });
+    if (!(unlimitedRequest)) {
+      dataQuery = dataQuery.skip(skip).limit(resolvedLimit);
+    }
+    const data = await dataQuery.lean();
 
     let syncState = null;
     let syncKey = null;
@@ -949,8 +981,8 @@ app.get('/api/data', async (req, res) => {
       }
     }
 
-    const dataTimeRange = await getDataTimeRange(rangeFilter);
-    const fullDataTimeRange = await getDataTimeRange();
+    const dataTimeRange = await getDataTimeRange(rangeFilter, normalizedRangeField);
+    const fullDataTimeRange = await getDataTimeRange(null, normalizedRangeField);
     const missingRange = computeMissingRange(rangeStart, rangeEnd, dataTimeRange);
     if (missingRange) {
       await enqueueSync({
@@ -994,20 +1026,144 @@ app.get('/api/data', async (req, res) => {
             incremental: !!syncState.incremental
           }
         : null,
-      pagination: {
-        page,
-        limit,
-        total,
-        totalPages: Math.ceil(total / limit),
-        hasNext: page * limit < total,
-        hasPrev: page > 1
-      }
+      pagination: unlimitedRequest
+        ? {
+            page: 1,
+            limit: total,
+            total,
+            totalPages: 1,
+            hasNext: false,
+            hasPrev: false
+          }
+        : {
+            page,
+            limit: resolvedLimit,
+            total,
+            totalPages: Math.ceil(total / resolvedLimit),
+            hasNext: page * resolvedLimit < total,
+            hasPrev: page > 1
+          }
     });
   } catch (error) {
     res.status(500).json({
       success: false,
       message: error.message
     });
+  }
+});
+
+/**
+ * GET /api/data/view
+ * Stream full set of documents that match the query so the UI can display the exact range.
+ */
+app.get('/api/data/view', async (req, res) => {
+  try {
+    const sortBy = req.query.sortBy || 'scrapedAt';
+    const sortOrder = req.query.sortOrder === 'asc' ? 1 : -1;
+    const inputStart = req.query.start ?? req.query.from ?? req.query.st ?? null;
+    const inputEnd = req.query.end ?? req.query.to ?? req.query.ed ?? null;
+    const rangeStart = normalizeDateInput(inputStart, false);
+    const rangeEnd = normalizeDateInput(inputEnd, true);
+    const rangeField = (req.query.rangeField || req.query.field || 'scrapedAt').trim();
+    const allowedFields = ['scrapedAt', 'crt_time'];
+    const normalizedRangeField = allowedFields.includes(rangeField) ? rangeField : 'scrapedAt';
+    const rangeFilter = buildRangeQuery(rangeStart, rangeEnd, normalizedRangeField);
+
+    const search = req.query.search || '';
+    const buildQuery = (overrideFilter) => {
+      const parts = [];
+      if (search) {
+        parts.push({
+          $or: [
+            { id: { $regex: search, $options: 'i' } },
+            { customerInfo: { $regex: search, $options: 'i' } },
+            { account: { $regex: search, $options: 'i' } },
+            { deviceNumber: { $regex: search, $options: 'i' } }
+          ]
+        });
+      }
+      if (overrideFilter) parts.push(overrideFilter);
+      if (parts.length === 0) return {};
+      return parts.length === 1 ? parts[0] : { $and: parts };
+    };
+
+    let currentRangeField = normalizedRangeField;
+    let currentRangeFilter = rangeFilter;
+    if ((!rangeStart || !rangeEnd) && normalizedRangeField) {
+      const autoRange = await getLatestMonthRange(normalizedRangeField);
+      if (autoRange) {
+        if (!rangeStart) rangeStart = autoRange.start;
+        if (!rangeEnd) rangeEnd = autoRange.end;
+        const autoFilter = buildRangeQuery(rangeStart, rangeEnd, normalizedRangeField);
+        if (autoFilter) {
+          currentRangeFilter = autoFilter;
+        }
+      }
+    }
+    let query = buildQuery(currentRangeFilter);
+    let total = await Skin.countDocuments(query);
+
+    if (
+      total === 0 &&
+      normalizedRangeField === 'scrapedAt' &&
+      rangeFilter
+    ) {
+      const fallbackFilter = buildRangeQuery(rangeStart, rangeEnd, 'crt_time');
+      if (fallbackFilter) {
+        const fallbackQuery = buildQuery(fallbackFilter);
+        const fallbackTotal = await Skin.countDocuments(fallbackQuery);
+        if (fallbackTotal > 0) {
+          currentRangeField = 'crt_time';
+          currentRangeFilter = fallbackFilter;
+          query = fallbackQuery;
+          total = fallbackTotal;
+        }
+      }
+    }
+
+    const cursor = Skin.find(query)
+      .sort({ [sortBy]: sortOrder })
+      .lean()
+      .cursor();
+
+    const dataTimeRange = await getDataTimeRange(currentRangeFilter, currentRangeField);
+    const statsRange = (dataTimeRange?.from && dataTimeRange?.to)
+      ? { start: dataTimeRange.from, end: dataTimeRange.to }
+      : (rangeStart && rangeEnd ? { start: rangeStart, end: rangeEnd } : null);
+    const displayDataTimeRange = formatDataRangeForDisplay(dataTimeRange);
+    const displayStatsRange = formatRangeForDisplay(statsRange);
+
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    const meta = {
+      success: true,
+      total,
+      range: displayStatsRange,
+      dataTimeRange: displayDataTimeRange
+    };
+    const metaJson = JSON.stringify(meta);
+    res.write(`${metaJson.slice(0, -1)},"data":[`);
+
+    let first = true;
+    for await (const doc of cursor) {
+      const chunk = `${first ? '' : ','}${JSON.stringify(doc)}`;
+      first = false;
+      if (!res.write(chunk)) {
+        await once(res, 'drain');
+      }
+    }
+
+    res.write(']}');
+    res.end();
+  } catch (error) {
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        message: error.message
+      });
+    } else {
+      console.error('Data view stream failed:', error);
+      res.end();
+    }
   }
 });
 
@@ -1021,7 +1177,10 @@ app.get('/api/data/stats', async (req, res) => {
     const inputEnd = req.query.end ?? req.query.to ?? null;
     const rangeStart = normalizeDateInput(inputStart, false);
     const rangeEnd = normalizeDateInput(inputEnd, true);
-    const rangeFilter = buildRangeQuery(rangeStart, rangeEnd);
+    const rangeField = (req.query.rangeField || req.query.field || 'scrapedAt').trim();
+    const allowedFields = ['scrapedAt', 'crt_time'];
+    const normalizedRangeField = allowedFields.includes(rangeField) ? rangeField : 'scrapedAt';
+    const rangeFilter = buildRangeQuery(rangeStart, rangeEnd, normalizedRangeField);
     const baseMatch = rangeFilter ? { $match: rangeFilter } : null;
     const total = await Skin.countDocuments(rangeFilter || {});
     const byGender = await Skin.aggregate([
@@ -1041,9 +1200,9 @@ app.get('/api/data/stats', async (req, res) => {
       { $sort: { count: -1 } }
     ]);
 
-    const oldest = await Skin.findOne(rangeFilter || {}).sort({ scrapedAt: 1 }).lean();
-    const newest = await Skin.findOne(rangeFilter || {}).sort({ scrapedAt: -1 }).lean();
-    const dataTimeRange = await getDataTimeRange(rangeFilter);
+    const oldest = await Skin.findOne(rangeFilter || {}).sort({ [normalizedRangeField]: 1 }).lean();
+    const newest = await Skin.findOne(rangeFilter || {}).sort({ [normalizedRangeField]: -1 }).lean();
+    const dataTimeRange = await getDataTimeRange(rangeFilter, normalizedRangeField);
     const displayDataTimeRange = formatDataRangeForDisplay(dataTimeRange);
     const lastSync = await SyncState.findOne({ status: 'success' })
       .sort({ lastSuccessAt: -1 })
@@ -1213,6 +1372,7 @@ async function startScrapingAllPages() {
   scrapingStatus.error = null;
   scrapingStatus.endTime = null;
 
+  console.log('🧭 Browser executablePath:', cfg.execPath);
   const browser = await puppeteer.launch({
     headless: cfg.headless,
     executablePath: cfg.execPath,

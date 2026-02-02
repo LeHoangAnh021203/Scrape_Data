@@ -93,10 +93,22 @@ bitmoji-scraper/
 - Verify XHR endpoints are being called
 - Adjust scroll settings to trigger more requests
 
-### Detection/Blocking
-- Set `PUPPETEER_EXECUTABLE_PATH` to system Chrome
+-### Detection/Blocking
+- Ensure Puppeteer can launch its bundled browser; the scraper now defaults to `puppeteer.executablePath()` so you rarely need to set `PUPPETEER_EXECUTABLE_PATH` manually unless you have a custom Chrome install or version requirement.
 - Add random delays between actions
 - Consider using stealth plugins
+
+### Range filtering
+- `GET /api/data` và `/api/data/stats` hỗ trợ `start`/`from` + `end`/`to`.  
+- Thêm `rangeField=scrapedAt` (mặc định) hoặc `rangeField=crt_time` nếu bạn muốn lọc theo `crt_time` thay vì thời điểm `scrapedAt`.  
+- Thống kê trả về (fullRange/dataTimeRange) sẽ phản ánh trường mà bạn chọn.
+- `GET /api/data` có thêm `noLimit=true` (hoặc `limit=0`/`limit` là số âm) để tắt phân trang và trả về toàn bộ bản ghi khớp query (nhớ kiểm tra dung lượng khi gọi trong một khoảng lớn).
+- `GET /api/data/view` stream trực tiếp tập kết quả cho UI với metadata range/total, nên dễ hiển thị các bản ghi trong range mà không cần trang hóa (range + search + rangeField giống `/api/data`).  
+  - Nếu không truyền `start`/`end`, endpoint sẽ tự lấy tháng mới nhất có bản ghi và stream range đó.  
+  - `buildRangeQuery` tự xét `rangeField=crt_time` là string nên dùng `st`/`ed` raw, còn `rangeField=scrapedAt` dùng Date/bộ lọc bình thường; cả hai đều đã có index.  
+  - Nếu không truyền `rangeField`, endpoint sẽ cố gắng lọc theo `scrapedAt` trước rồi fallback sang `crt_time` nếu range đó trả về 0 bản ghi.
+  - `buildRangeQuery` tự xét `rangeField=crt_time` là string nên dùng `st`/`ed` raw thay vì convert sang Date, vì `crt_time` lưu dưới dạng chuỗi.  
+  - Nếu không truyền `rangeField`, endpoint sẽ cố gắng lọc theo `scrapedAt` trước rồi fallback sang `crt_time` nếu range đó trả về 0 bản ghi.
 
 ## Legal Notice
 

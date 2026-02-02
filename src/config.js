@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import fs from 'node:fs';
+import puppeteer from 'puppeteer';
 
 let forceHeaders = {};
 const rawForceHeaders = process.env.FORCE_HEADERS_JSON || '';
@@ -10,6 +12,20 @@ if (rawForceHeaders) {
     }
   } catch (_) {
     forceHeaders = {};
+  }
+}
+
+const defaultExecPath = typeof puppeteer.executablePath === 'function' ? puppeteer.executablePath() : undefined;
+const envExecPath = process.env.PUPPETEER_EXECUTABLE_PATH;
+let resolvedExecPath = envExecPath;
+if (envExecPath) {
+  try {
+    fs.accessSync(envExecPath, fs.constants.X_OK);
+  } catch (err) {
+    console.warn(
+      `PUPPETEER_EXECUTABLE_PATH (${envExecPath}) does not exist/is not executable; falling back to Puppeteer default.`
+    );
+    resolvedExecPath = undefined;
   }
 }
 
@@ -48,7 +64,7 @@ export const cfg = {
   headless: String(process.env.HEADLESS || 'true') === 'true',
   navTimeout: Number(process.env.NAV_TIMEOUT_MS || 60000),
   waitUntil: process.env.WAIT_UNTIL || 'networkidle2',
-  execPath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+  execPath: resolvedExecPath || defaultExecPath,
   sourceTimezone: process.env.DATA_SOURCE_TIMEZONE || 'Asia/Shanghai',
   displayTimezone: process.env.DATA_DISPLAY_TIMEZONE || 'Asia/Ho_Chi_Minh',
   auth: {
