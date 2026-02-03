@@ -1,7 +1,7 @@
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import puppeteer from 'puppeteer';
+import puppeteer from 'puppeteer-core';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,8 +21,10 @@ let stats = {
 
 // Scraping function that includes ALL rows
 async function scrapeData() {
-  const browser = await puppeteer.launch({ 
-    headless: false, // Show browser for debugging
+  const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+  const browser = await puppeteer.launch({
+    executablePath,
+    headless: false,
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
   
