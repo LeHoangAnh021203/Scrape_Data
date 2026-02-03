@@ -1,8 +1,29 @@
 import mongoose from 'mongoose';
 
+const DEFAULT_OPTIONS = {
+  maxPoolSize: 50,
+  waitQueueTimeoutMS: 5000,
+  bufferCommands: false,
+  autoIndex: false
+};
+
 export async function connectDB(uri) {
-  await mongoose.connect(uri);
+  if (mongoose.connection.readyState >= 1) {
+    console.log('✅ MongoDB already connected (reused connection)');
+    return mongoose.connection;
+  }
+
+  if (!globalThis.__mongooseConnection) {
+    globalThis.__mongooseConnection = mongoose.connect(uri, {
+      ...DEFAULT_OPTIONS,
+      useNewUrlParser: true,
+      useUnifiedTopology: true
+    });
+  }
+
+  await globalThis.__mongooseConnection;
   console.log('✅ MongoDB connected');
+  return mongoose.connection;
 }
 
 const SkinSchema = new mongoose.Schema(

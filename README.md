@@ -98,6 +98,14 @@ bitmoji-scraper/
 - Add random delays between actions
 - Consider using stealth plugins
 
+### Connection & Atlas performance tips
+- Mongoose/TL: `src/db.js` reuse kết nối; `connectDB` giờ cache connection trong `globalThis` và bật `maxPoolSize`/`waitQueueTimeoutMS` để giữ kết nối Atlas sống suốt session (tránh open/close mỗi request).  
+- Chuỗi kết nối nên chứa `retryWrites=true&w=majority&readPreference=nearest` để tận dụng replica gần nhất, giảm latency:  
+  ```
+  MONGO_URI=mongodb+srv://.../bitmoji?retryWrites=true&w=majority&readPreference=nearest
+  ```
+  Khi muốn phân biệt read/write, bạn vẫn có thể truyền `readPreference`/`writeConcern` trong code từng operation.  
+
 ### Range filtering
 - `GET /api/data` và `/api/data/stats` hỗ trợ `start`/`from` + `end`/`to`.  
 - Thêm `rangeField=scrapedAt` (mặc định) hoặc `rangeField=crt_time` nếu bạn muốn lọc theo `crt_time` thay vì thời điểm `scrapedAt`.  
