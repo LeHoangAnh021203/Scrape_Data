@@ -913,7 +913,7 @@ app.get('/api/data', async (req, res) => {
     const resolvedLimit = unlimitedRequest ? null : Math.min(parsedLimit ?? 50, 500);
     const skip = unlimitedRequest ? 0 : (page - 1) * resolvedLimit;
     const search = req.query.search || '';
-    const sortBy = req.query.sortBy || 'scrapedAt';
+    const sortByArg = (req.query.sortBy || '').trim();
     const sortOrder = req.query.sortOrder === 'asc' ? 1 : -1;
     const inputStart = req.query.start ?? req.query.from ?? null;
     const inputEnd = req.query.end ?? req.query.to ?? null;
@@ -960,7 +960,8 @@ app.get('/api/data', async (req, res) => {
     const total = await Skin.countDocuments(query);
 
     // Get data
-    let dataQuery = Skin.find(query).sort({ [sortBy]: sortOrder });
+    const resolvedSortField = allowedFields.includes(sortByArg) ? sortByArg : normalizedRangeField;
+    let dataQuery = Skin.find(query).sort({ [resolvedSortField]: sortOrder });
     if (!(unlimitedRequest)) {
       dataQuery = dataQuery.skip(skip).limit(resolvedLimit);
     }
@@ -1058,7 +1059,7 @@ app.get('/api/data', async (req, res) => {
  */
 app.get('/api/data/view', async (req, res) => {
   try {
-    const sortBy = req.query.sortBy || 'scrapedAt';
+    const sortByArg = (req.query.sortBy || '').trim();
     const sortOrder = req.query.sortOrder === 'asc' ? 1 : -1;
     const inputStart = req.query.start ?? req.query.from ?? req.query.st ?? null;
     const inputEnd = req.query.end ?? req.query.to ?? req.query.ed ?? null;
@@ -1121,8 +1122,11 @@ app.get('/api/data/view', async (req, res) => {
       }
     }
 
+    const effectiveSortField = allowedFields.includes(sortByArg)
+      ? sortByArg
+      : currentRangeField;
     const cursor = Skin.find(query)
-      .sort({ [sortBy]: sortOrder })
+      .sort({ [effectiveSortField]: sortOrder })
       .lean()
       .cursor();
 
