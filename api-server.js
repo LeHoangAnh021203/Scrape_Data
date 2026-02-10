@@ -10,6 +10,18 @@ import { once } from 'events';
 const app = express();
 const PORT = process.env.API_PORT || 3001;
 
+const isWithinSyncWindow = (now = new Date()) => {
+  const startHour = Number.isFinite(cfg.syncWindow?.startHour) ? cfg.syncWindow.startHour : 9;
+  const endHour = Number.isFinite(cfg.syncWindow?.endHour) ? cfg.syncWindow.endHour : 22;
+  const currentHour = now.getHours();
+
+  if (startHour === endHour) return true;
+  if (startHour < endHour) {
+    return currentHour >= startHour && currentHour < endHour;
+  }
+  return currentHour >= startHour || currentHour < endHour;
+};
+
 const normalizeAccessToken = (raw) => {
   if (!raw) return '';
   const token = String(raw).trim();
@@ -1059,6 +1071,7 @@ app.get('/api/data', async (req, res) => {
  */
 app.get('/api/data/view', async (req, res) => {
   try {
+    const debugExplain = String(req.query.debugExplain || req.query.explain || '0') === '1';
     const sortByArg = (req.query.sortBy || '').trim();
     const sortOrder = req.query.sortOrder === 'asc' ? 1 : -1;
     const inputStart = req.query.start ?? req.query.from ?? req.query.st ?? null;
@@ -1125,6 +1138,21 @@ app.get('/api/data/view', async (req, res) => {
     const effectiveSortField = allowedFields.includes(sortByArg)
       ? sortByArg
       : currentRangeField;
+
+    if (debugExplain) {
+      const explain = await Skin.find(query)
+        .sort({ [effectiveSortField]: sortOrder })
+        .explain('executionStats');
+      return res.json({
+        success: true,
+        debugExplain: true,
+        query,
+        sort: { [effectiveSortField]: sortOrder },
+        total,
+        explain
+      });
+    }
+
     const cursor = Skin.find(query)
       .sort({ [effectiveSortField]: sortOrder })
       .lean()
@@ -1854,7 +1882,18 @@ async function handleAuthentication(page) {
 
   if (cfg.cron && cron.validate(cfg.cron)) {
     cron.schedule(cfg.cron, async () => {
-      if (scrapingStatus.isRunning) return;
+      const now = new Date();
+      console.log(`🕒 Cron tick at ${now.toLocaleString()}`);
+      if (scrapingStatus.isRunning) {
+        console.log('⏭️  Cron sync skipped: scraping is already running');
+        return;
+      }
+      if (!isWithinSyncWindow(now)) {
+        console.log(
+          `⏭️  Cron sync skipped at ${now.toLocaleString()} (outside window ${cfg.syncWindow.startHour}:00-${cfg.syncWindow.endHour}:00)`
+        );
+        return;
+      }
       const latestByCrt = await Skin.findOne({ crt_time: { $gt: '' } })
         .sort({ crt_time: -1 })
         .lean();
@@ -1863,12 +1902,18 @@ async function handleAuthentication(page) {
         : null;
       const latest = latestByCrt?.crt_time || latestByTest?.testTime || null;
       const latestDate = parseDateInput(latest);
-      if (!latestDate) return;
+      if (!latestDate) {
+        console.log('⏭️  Cron sync skipped: no latest record time found to build range');
+        return;
+      }
       const rangeStart = formatDateTime(new Date(latestDate.getTime() + 60 * 1000));
       const rangeEnd = formatDateTime(new Date());
       await enqueueSync({ rangeStart, rangeEnd, reason: 'cron' });
+      console.log(`✅ Cron sync enqueued: ${rangeStart} -> ${rangeEnd}`);
     });
-    console.log(`⏱️  Cron sync scheduled: ${cfg.cron}`);
+    console.log(
+      `⏱️  Cron sync scheduled: ${cfg.cron} (window ${cfg.syncWindow.startHour}:00-${cfg.syncWindow.endHour}:00, server local time)`
+    );
   }
 
   // Start server

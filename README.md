@@ -59,7 +59,9 @@ The scraper supports two extraction strategies:
 | `MONGO_URI` | MongoDB connection string | `mongodb://127.0.0.1:27017/bitmoji` |
 | `SERVER_A_ENDPOINT` | First fan-out endpoint | Required |
 | `SERVER_B_ENDPOINT` | Second fan-out endpoint | Optional |
-| `CRON_EXPR` | Cron schedule | `*/10 * * * *` (every 10 minutes) |
+| `CRON_EXPR` | Cron schedule | `*/30 * * * *` (every 30 minutes) |
+| `SYNC_WINDOW_START_HOUR` | Cron sync start hour (server local time, inclusive) | `9` |
+| `SYNC_WINDOW_END_HOUR` | Cron sync end hour (server local time, exclusive) | `22` |
 | `HEADLESS` | Run browser in headless mode | `true` |
 | `DATA_SOURCE_TIMEZONE` | Timezone that `crt_time` values originate from (used for timezone conversion) | `Asia/Shanghai` |
 | `DATA_DISPLAY_TIMEZONE` | Timezone used when reporting ranges back to clients | `Asia/Ho_Chi_Minh` |

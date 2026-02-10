@@ -66,7 +66,11 @@ export const cfg = {
   },
   mongoUri: process.env.MONGO_URI,
   endpoints: [process.env.SERVER_A_ENDPOINT, process.env.SERVER_B_ENDPOINT].filter(Boolean),
-  cron: process.env.CRON_EXPR || '*/10 * * * *',
+  cron: process.env.CRON_EXPR || '*/30 * * * *',
+  syncWindow: {
+    startHour: Number(process.env.SYNC_WINDOW_START_HOUR || 9),
+    endHour: Number(process.env.SYNC_WINDOW_END_HOUR || 22)
+  },
   headless: String(process.env.HEADLESS || 'true') === 'true',
   navTimeout: Number(process.env.NAV_TIMEOUT_MS || 60000),
   waitUntil: process.env.WAIT_UNTIL || 'networkidle2',
