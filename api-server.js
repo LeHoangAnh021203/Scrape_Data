@@ -250,15 +250,20 @@ const parseDateInput = (value) => {
   const raw = String(value).trim();
   if (!raw) return null;
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-    return new Date(`${raw}T00:00:00`);
+    const parsed = new Date(`${raw}T00:00:00`);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
   }
   if (/^\d{4}-\d{1,2}$/.test(raw)) {
     const [y, m] = raw.split('-').map(Number);
     if (!Number.isFinite(y) || !Number.isFinite(m) || m < 1 || m > 12) return null;
-    return new Date(y, m - 1, 1, 0, 0, 0, 0);
+    const parsed = new Date(y, m - 1, 1, 0, 0, 0, 0);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
   }
-  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(raw)) {
-    return new Date(raw.replace(' ', 'T') + ':00');
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$/.test(raw)) {
+    const normalized = raw.replace(' ', 'T');
+    const withSeconds = normalized.length === 16 ? `${normalized}:00` : normalized;
+    const parsed = new Date(withSeconds);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
   }
   const parsed = new Date(raw);
   return Number.isNaN(parsed.getTime()) ? null : parsed;
@@ -745,7 +750,7 @@ app.post('/api/scrape/full-sync', async (req, res) => {
     const latest = latestByCrt?.crt_time || latestByTest?.testTime || null;
     if (!rangeStart && latest) {
       const latestDate = parseDateInput(latest);
-      if (latestDate) {
+      if (latestDate && !Number.isNaN(latestDate.getTime())) {
         // Nhích lên 1 phút để tránh lấy trùng bản ghi đã có.
         rangeStart = formatDateTime(new Date(latestDate.getTime() + 60 * 1000));
       }
@@ -1915,7 +1920,7 @@ async function handleAuthentication(page) {
         : null;
       const latest = latestByCrt?.crt_time || latestByTest?.testTime || null;
       const latestDate = parseDateInput(latest);
-      if (!latestDate) {
+      if (!latestDate || Number.isNaN(latestDate.getTime())) {
         console.log('⏭️  Cron sync skipped: no latest record time found to build range');
         return;
       }
