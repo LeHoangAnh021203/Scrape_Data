@@ -10,10 +10,21 @@ import { once } from 'events';
 const app = express();
 const PORT = process.env.API_PORT || 3001;
 
+const getHourInTimezone = (now = new Date(), timezone = 'Asia/Ho_Chi_Minh') => {
+  const hourText = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    hour: '2-digit',
+    hour12: false
+  }).format(now);
+  const hour = Number(hourText);
+  return Number.isFinite(hour) ? hour : now.getHours();
+};
+
 const isWithinSyncWindow = (now = new Date()) => {
   const startHour = Number.isFinite(cfg.syncWindow?.startHour) ? cfg.syncWindow.startHour : 9;
   const endHour = Number.isFinite(cfg.syncWindow?.endHour) ? cfg.syncWindow.endHour : 22;
-  const currentHour = now.getHours();
+  const timezone = cfg.syncTimezone || 'Asia/Ho_Chi_Minh';
+  const currentHour = getHourInTimezone(now, timezone);
 
   if (startHour === endHour) return true;
   if (startHour < endHour) {
@@ -1883,14 +1894,16 @@ async function handleAuthentication(page) {
   if (cfg.cron && cron.validate(cfg.cron)) {
     cron.schedule(cfg.cron, async () => {
       const now = new Date();
-      console.log(`🕒 Cron tick at ${now.toLocaleString()}`);
+      const timezone = cfg.syncTimezone || 'Asia/Ho_Chi_Minh';
+      const timezoneNow = now.toLocaleString('en-US', { timeZone: timezone });
+      console.log(`🕒 Cron tick at server=${now.toLocaleString()} | ${timezone}=${timezoneNow}`);
       if (scrapingStatus.isRunning) {
         console.log('⏭️  Cron sync skipped: scraping is already running');
         return;
       }
       if (!isWithinSyncWindow(now)) {
         console.log(
-          `⏭️  Cron sync skipped at ${now.toLocaleString()} (outside window ${cfg.syncWindow.startHour}:00-${cfg.syncWindow.endHour}:00)`
+          `⏭️  Cron sync skipped at ${timezoneNow} ${timezone} (outside window ${cfg.syncWindow.startHour}:00-${cfg.syncWindow.endHour}:00)`
         );
         return;
       }
@@ -1912,7 +1925,7 @@ async function handleAuthentication(page) {
       console.log(`✅ Cron sync enqueued: ${rangeStart} -> ${rangeEnd}`);
     });
     console.log(
-      `⏱️  Cron sync scheduled: ${cfg.cron} (window ${cfg.syncWindow.startHour}:00-${cfg.syncWindow.endHour}:00, server local time)`
+      `⏱️  Cron sync scheduled: ${cfg.cron} (window ${cfg.syncWindow.startHour}:00-${cfg.syncWindow.endHour}:00, timezone ${cfg.syncTimezone})`
     );
   }
 

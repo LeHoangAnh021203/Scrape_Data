@@ -71,6 +71,7 @@ export const cfg = {
     startHour: Number(process.env.SYNC_WINDOW_START_HOUR || 9),
     endHour: Number(process.env.SYNC_WINDOW_END_HOUR || 22)
   },
+  syncTimezone: process.env.SYNC_TIMEZONE || 'Asia/Ho_Chi_Minh',
   headless: String(process.env.HEADLESS || 'true') === 'true',
   navTimeout: Number(process.env.NAV_TIMEOUT_MS || 60000),
   waitUntil: process.env.WAIT_UNTIL || 'networkidle2',

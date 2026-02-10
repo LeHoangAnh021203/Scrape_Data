@@ -62,6 +62,7 @@ The scraper supports two extraction strategies:
 | `CRON_EXPR` | Cron schedule | `*/30 * * * *` (every 30 minutes) |
 | `SYNC_WINDOW_START_HOUR` | Cron sync start hour (server local time, inclusive) | `9` |
 | `SYNC_WINDOW_END_HOUR` | Cron sync end hour (server local time, exclusive) | `22` |
+| `SYNC_TIMEZONE` | Timezone used for sync window evaluation | `Asia/Ho_Chi_Minh` |
 | `HEADLESS` | Run browser in headless mode | `true` |
 | `DATA_SOURCE_TIMEZONE` | Timezone that `crt_time` values originate from (used for timezone conversion) | `Asia/Shanghai` |
 | `DATA_DISPLAY_TIMEZONE` | Timezone used when reporting ranges back to clients | `Asia/Ho_Chi_Minh` |
