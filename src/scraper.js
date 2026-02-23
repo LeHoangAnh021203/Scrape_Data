@@ -159,17 +159,38 @@ async function handleAuthentication(page) {
 
 async function persist(items) {
   if (!items.length) return 0;
-  let upserts = 0;
-  for (const it of items) {
+  const batchSize = Number(process.env.DB_BULK_BATCH_SIZE || 500);
+  const now = new Date();
+  const ops = items.map((it) => {
     const hashedKey = crypto.createHash('sha1').update(Skin.keyFor(it)).digest('hex');
-    await Skin.updateOne(
-      { hashedKey },
-      { $set: { ...it, hashedKey, scrapedAt: new Date() } },
-      { upsert: true }
-    );
-    upserts++;
+    return {
+      updateOne: {
+        filter: { hashedKey },
+        update: { $set: { ...it, hashedKey, scrapedAt: now } },
+        upsert: true
+      }
+    };
+  });
+
+  let matchedCount = 0;
+  let modifiedCount = 0;
+  let upsertedCount = 0;
+
+  console.log(`💾 Saving to database... ops=${ops.length}, batchSize=${batchSize}`);
+  console.time('db-save');
+  for (let i = 0; i < ops.length; i += batchSize) {
+    const batch = ops.slice(i, i + batchSize);
+    const result = await Skin.bulkWrite(batch, { ordered: false });
+    matchedCount += result?.matchedCount || 0;
+    modifiedCount += result?.modifiedCount || 0;
+    upsertedCount += result?.upsertedCount || 0;
   }
-  return upserts;
+  console.timeEnd('db-save');
+  console.log(
+    `💾 DB write stats: matched=${matchedCount}, modified=${modifiedCount}, upserted=${upsertedCount}`
+  );
+
+  return items.length;
 }
 
 async function runOnce() {

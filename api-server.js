@@ -477,6 +477,12 @@ const formatDateTime = (date) => {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 };
 
+const formatDateTimeInTimezone = (date, timezone) => {
+  const formatted = formatDateInTimezone(date, timezone);
+  if (!formatted) return formatDateTime(date);
+  return formatted.slice(0, 16);
+};
+
 const rangeKey = (rangeStart, rangeEnd) => `range:${rangeStart || 'none'}:${rangeEnd || 'none'}`;
 
 const buildRangeQuery = (rangeStart, rangeEnd, field = 'scrapedAt') => {
@@ -1786,21 +1792,36 @@ async function scrapeAllPagesOnce({
     if (saveToDb) {
       console.log('💾 Saving to database...');
       const crypto = await import('node:crypto');
-      for (const item of items) {
+      const batchSize = Number(process.env.DB_BULK_BATCH_SIZE || 500);
+      const now = new Date();
+      const ops = items.map((item) => {
         const hashedKey = crypto.createHash('sha1').update(Skin.keyFor(item)).digest('hex');
-        const result = await Skin.updateOne(
-          { hashedKey },
-          { $set: { ...item, hashedKey, scrapedAt: new Date() } },
-          { upsert: true }
-        );
-        upserts++;
-        if (result.upsertedCount && result.upsertedCount > 0) {
-          newCount += result.upsertedCount;
-        } else if (result.modifiedCount && result.modifiedCount > 0) {
-          updatedCount += result.modifiedCount;
-        } else {
-          unchangedCount += 1;
-        }
+        return {
+          updateOne: {
+            filter: { hashedKey },
+            update: { $set: { ...item, hashedKey, scrapedAt: now } },
+            upsert: true
+          }
+        };
+      });
+
+      console.log(`💾 DB bulk write: ops=${ops.length}, batchSize=${batchSize}`);
+      console.time('db-save');
+      for (let i = 0; i < ops.length; i += batchSize) {
+        const batch = ops.slice(i, i + batchSize);
+        const result = await Skin.bulkWrite(batch, { ordered: false });
+        upserts += batch.length;
+        newCount += result?.upsertedCount || 0;
+        updatedCount += result?.modifiedCount || 0;
+      }
+      console.timeEnd('db-save');
+      unchangedCount = Math.max(0, upserts - newCount - updatedCount);
+      console.log(
+        `💾 DB write stats: processed=${upserts}, new=${newCount}, updated=${updatedCount}, unchanged=${unchangedCount}`
+      );
+      if (upserts > 0) {
+        const perSecond = (upserts / Math.max(1, (Date.now() - now.getTime()) / 1000)).toFixed(1);
+        console.log(`💾 DB throughput: ~${perSecond} ops/sec`);
       }
       console.log(`💾 Upserted ${upserts} records`);
     }
@@ -1919,13 +1940,24 @@ async function handleAuthentication(page) {
         ? await Skin.findOne({ testTime: { $gt: '' } }).sort({ testTime: -1 }).lean()
         : null;
       const latest = latestByCrt?.crt_time || latestByTest?.testTime || null;
-      const latestDate = parseDateInput(latest);
+      const dataTimezone = cfg.sourceTimezone || cfg.syncTimezone || 'Asia/Ho_Chi_Minh';
+      const latestDate = parseDateInTimezone(latest, dataTimezone) || parseDateInput(latest);
       if (!latestDate || Number.isNaN(latestDate.getTime())) {
         console.log('⏭️  Cron sync skipped: no latest record time found to build range');
         return;
       }
-      const rangeStart = formatDateTime(new Date(latestDate.getTime() + 60 * 1000));
-      const rangeEnd = formatDateTime(new Date());
+      const rangeStartDate = new Date(latestDate.getTime() + 60 * 1000);
+      const rangeEndDate = new Date();
+      if (rangeStartDate.getTime() > rangeEndDate.getTime()) {
+        const timezone = cfg.syncTimezone || 'Asia/Ho_Chi_Minh';
+        console.log(
+          `⏭️  Cron sync skipped: computed range is invalid (${formatDateTimeInTimezone(rangeStartDate, timezone)} > ${formatDateTimeInTimezone(rangeEndDate, timezone)}), latest=${latest || 'n/a'}`
+        );
+        return;
+      }
+      const rangeTimezone = cfg.sourceTimezone || cfg.syncTimezone || 'Asia/Ho_Chi_Minh';
+      const rangeStart = formatDateTimeInTimezone(rangeStartDate, rangeTimezone);
+      const rangeEnd = formatDateTimeInTimezone(rangeEndDate, rangeTimezone);
       await enqueueSync({ rangeStart, rangeEnd, reason: 'cron' });
       console.log(`✅ Cron sync enqueued: ${rangeStart} -> ${rangeEnd}`);
     });
