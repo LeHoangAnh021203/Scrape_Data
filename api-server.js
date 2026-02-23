@@ -1918,9 +1918,10 @@ async function handleAuthentication(page) {
   }
 
   if (cfg.cron && cron.validate(cfg.cron)) {
+    const cronTimezone = cfg.syncTimezone || 'Asia/Ho_Chi_Minh';
     cron.schedule(cfg.cron, async () => {
       const now = new Date();
-      const timezone = cfg.syncTimezone || 'Asia/Ho_Chi_Minh';
+      const timezone = cronTimezone;
       const timezoneNow = now.toLocaleString('en-US', { timeZone: timezone });
       console.log(`🕒 Cron tick at server=${now.toLocaleString()} | ${timezone}=${timezoneNow}`);
       if (scrapingStatus.isRunning) {
@@ -1960,9 +1961,9 @@ async function handleAuthentication(page) {
       const rangeEnd = formatDateTimeInTimezone(rangeEndDate, rangeTimezone);
       await enqueueSync({ rangeStart, rangeEnd, reason: 'cron' });
       console.log(`✅ Cron sync enqueued: ${rangeStart} -> ${rangeEnd}`);
-    });
+    }, { timezone: cronTimezone });
     console.log(
-      `⏱️  Cron sync scheduled: ${cfg.cron} (window ${cfg.syncWindow.startHour}:00-${cfg.syncWindow.endHour}:00, timezone ${cfg.syncTimezone})`
+      `⏱️  Cron sync scheduled: ${cfg.cron} (window ${cfg.syncWindow.startHour}:00-${cfg.syncWindow.endHour}:00, timezone ${cronTimezone})`
     );
   }
 
