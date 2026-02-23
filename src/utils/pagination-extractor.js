@@ -23,6 +23,8 @@ export async function extractAllPages(page, options = {}) {
   const maxFetchRetries = Number(options.maxFetchRetries ?? process.env.MAX_FETCH_RETRIES ?? 5);
   const useNodeFetch = options.useNodeFetch ??
     String(process.env.USE_NODE_FETCH ?? 'true') === 'true';
+  const enrichGoods = options.enrichGoods ??
+    String(process.env.ENRICH_GOODS ?? 'true') === 'true';
   let emptyPageStop = Number(options.emptyPageStop ?? process.env.EMPTY_PAGE_STOP ?? 5);
   const pageDelayMs = Number(options.pageDelayMs ?? process.env.PAGE_DELAY_MS ?? 800);
   const errorDelayMs = Number(options.errorDelayMs ?? process.env.ERROR_DELAY_MS ?? 2000);
@@ -303,6 +305,33 @@ export async function extractAllPages(page, options = {}) {
       seenKeys.add(key);
     }
     collectedData.push(item);
+  };
+
+  const collectGoodsIds = (value, bucket) => {
+    if (!value) return;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        collectGoodsIds(item, bucket);
+      }
+      return;
+    }
+    if (typeof value === 'string') {
+      for (const token of value.split(',')) {
+        const id = String(token || '').trim();
+        if (id) bucket.add(id);
+      }
+      return;
+    }
+    if (typeof value !== 'object') return;
+    for (const [key, child] of Object.entries(value)) {
+      if (key === 'goods') {
+        collectGoodsIds(child, bucket);
+        continue;
+      }
+      if (child && typeof child === 'object') {
+        collectGoodsIds(child, bucket);
+      }
+    }
   };
 
   try {
@@ -1268,6 +1297,116 @@ export async function extractAllPages(page, options = {}) {
       console.log(`🧭 Corrected apiTotal ${total} -> ${collectedData.length} (unique count)`);
       total = collectedData.length;
     }
+
+    if (enrichGoods && collectedData.length > 0 && apiConfig?.url) {
+      const goodsMap = new Map();
+      const toGoodsUrl = (baseUrl) => {
+        const urlObj = new URL(baseUrl);
+        urlObj.pathname = '/skinMgrSrv/goods/list';
+        urlObj.search = '';
+        return urlObj.toString();
+      };
+      const goodsUrl = toGoodsUrl(apiConfig.url);
+      const normalizeGoodsItem = (item) => {
+        if (!item || typeof item !== 'object') return null;
+        const id = item.id != null ? String(item.id) : '';
+        if (!id) return null;
+        const pic = item.goods_pic || item.pic || item.image || '';
+        const image = pic && !String(pic).startsWith('http')
+          ? `https://zm.bitmoji-zmlh.com/fileSvr/get/${pic}`
+          : (pic || '');
+        return {
+          id,
+          name: item.goods_name || item.name || item.title || '',
+          image,
+          price: item.price || item.sale_price || item.goods_price || '',
+          category: item.type || item.category || ''
+        };
+      };
+      const parseGoodsResponse = (result) => {
+        const data = result?.data || result || {};
+        const list = Array.isArray(data?.list)
+          ? data.list
+          : (Array.isArray(data?.data?.list) ? data.data.list : []);
+        const total = data?.total ?? data?.data?.total ?? null;
+        const pageSize = data?.pageSize ?? data?.data?.pageSize ?? null;
+        return { list, total, pageSize };
+      };
+      const fetchGoodsPage = async (pageNum = 1, pageSizeValue = 200) => {
+        const payload = {
+          code: '-1',
+          page: String(pageNum),
+          pageSize: String(pageSizeValue),
+          weidu: 'all'
+        };
+        try {
+          const { default: axios } = await import('axios');
+          const params = new URLSearchParams();
+          Object.entries(payload).forEach(([k, v]) => {
+            if (v != null) params.set(k, String(v));
+          });
+          const headers = {
+            accept: 'application/json, text/plain, */*',
+            'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+            referer: getHeaderValue(apiConfig.headers, 'referer') || 'https://zm.bitmoji-zmlh.com/skinmgr/',
+            ...(baseHeaders || {})
+          };
+          const res = await axios({
+            method: 'POST',
+            url: goodsUrl,
+            headers,
+            data: params.toString(),
+            timeout: 30000,
+            validateStatus: () => true
+          });
+          return parseGoodsResponse(res?.data);
+        } catch (err) {
+          if (pageNum === 1) {
+            console.log(`⚠️  goods/list fetch failed: ${err?.message || err}`);
+          }
+          return { list: [], total: null, pageSize: null };
+        }
+      };
+
+      const firstGoodsPage = await fetchGoodsPage(1, 200);
+      for (const raw of firstGoodsPage.list || []) {
+        const normalized = normalizeGoodsItem(raw);
+        if (normalized) goodsMap.set(normalized.id, normalized);
+      }
+      const goodsTotal = Number(firstGoodsPage.total || 0);
+      const goodsPageSize = Number(firstGoodsPage.pageSize || 0);
+      if (goodsTotal > 0 && goodsPageSize > 0 && goodsTotal > goodsMap.size) {
+        const goodsPages = Math.ceil(goodsTotal / goodsPageSize);
+        for (let p = 2; p <= goodsPages; p++) {
+          const nextPage = await fetchGoodsPage(p, goodsPageSize);
+          for (const raw of nextPage.list || []) {
+            const normalized = normalizeGoodsItem(raw);
+            if (normalized) goodsMap.set(normalized.id, normalized);
+          }
+        }
+      }
+
+      if (goodsMap.size > 0) {
+        for (const item of collectedData) {
+          const ids = new Set();
+          collectGoodsIds(item?.analysis, ids);
+          if (ids.size === 0) {
+            const fallback = item?.goods || item?.analysis?.final_result?.goods || null;
+            collectGoodsIds(fallback, ids);
+          }
+          const goodsIds = Array.from(ids);
+          if (goodsIds.length === 0) continue;
+          item.recommendedGoodsIds = goodsIds;
+          item.recommendedGoods = goodsIds
+            .map(id => goodsMap.get(id))
+            .filter(Boolean);
+        }
+        console.log(`🛍️  goods/list enriched: catalog=${goodsMap.size}, records=${collectedData.length}`);
+      } else {
+        console.log('⚠️  goods/list returned empty catalog, skip enrichment');
+      }
+    }
+
     console.log(`🎉 Hoàn tất! Tổng cộng: ${collectedData.length} bản ghi.`);
     console.log(`📊 Raw items seen: ${rawCount}`);
     if (dupCount > 0) {

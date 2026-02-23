@@ -15,9 +15,7 @@ export async function connectDB(uri) {
 
   if (!globalThis.__mongooseConnection) {
     globalThis.__mongooseConnection = mongoose.connect(uri, {
-      ...DEFAULT_OPTIONS,
-      useNewUrlParser: true,
-      useUnifiedTopology: true
+      ...DEFAULT_OPTIONS
     });
   }
 
