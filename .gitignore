@@ -2,6 +2,8 @@
 # data dumps
 *.gz
 *.json
+!package.json
+!package-lock.json
 
 # dependencies
 node_modules/
