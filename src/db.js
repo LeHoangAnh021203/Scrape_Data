@@ -7,6 +7,8 @@ const DEFAULT_OPTIONS = {
   autoIndex: false
 };
 
+let indexesEnsured = false;
+
 export async function connectDB(uri) {
   if (mongoose.connection.readyState >= 1) {
     console.log('✅ MongoDB already connected (reused connection)');
@@ -20,6 +22,18 @@ export async function connectDB(uri) {
   }
 
   await globalThis.__mongooseConnection;
+  if (!indexesEnsured) {
+    try {
+      await Promise.all([
+        Skin.createIndexes(),
+        SyncState.createIndexes()
+      ]);
+      indexesEnsured = true;
+      console.log('✅ MongoDB indexes ensured');
+    } catch (error) {
+      console.warn('⚠️  Failed to ensure MongoDB indexes:', error?.message || error);
+    }
+  }
   console.log('✅ MongoDB connected');
   return mongoose.connection;
 }
@@ -45,6 +59,14 @@ const SkinSchema = new mongoose.Schema(
   },
   { timestamps: true, strict: false }
 );
+
+SkinSchema.index({ result_id: 1 });
+SkinSchema.index({ id: 1 });
+SkinSchema.index({ customer_mobile: 1 });
+SkinSchema.index({ crt_time: -1 });
+SkinSchema.index({ createdAt: -1 });
+SkinSchema.index({ test_time: -1 });
+SkinSchema.index({ testTime: -1 });
 
 // Create an idempotency key from the most stable fields
 SkinSchema.statics.keyFor = function (doc) {

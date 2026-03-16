@@ -9,6 +9,10 @@ import { once } from 'events';
 
 const app = express();
 const PORT = process.env.API_PORT || 3001;
+const ALLOWED_RANGE_FIELDS = ['scrapedAt', 'crt_time'];
+const DEFAULT_RANGE_FIELD = ALLOWED_RANGE_FIELDS.includes((process.env.DEFAULT_RANGE_FIELD || '').trim())
+  ? (process.env.DEFAULT_RANGE_FIELD || '').trim()
+  : 'crt_time';
 
 const getHourInTimezone = (now = new Date(), timezone = 'Asia/Ho_Chi_Minh') => {
   const hourText = new Intl.DateTimeFormat('en-US', {
@@ -243,6 +247,11 @@ const normalizeDateInput = (value, isEnd = false) => {
     return `${y}-${pad(m)}-01 00:00`;
   }
   return raw;
+};
+
+const normalizeRangeField = (value) => {
+  const field = (value || DEFAULT_RANGE_FIELD).trim();
+  return ALLOWED_RANGE_FIELDS.includes(field) ? field : DEFAULT_RANGE_FIELD;
 };
 
 const parseDateInput = (value) => {
@@ -483,6 +492,66 @@ const formatDateTimeInTimezone = (date, timezone) => {
   return formatted.slice(0, 16);
 };
 
+const getLatestRecordAnchor = async () => {
+  const [latestByCrt, latestByTest, latestByScrapedAt] = await Promise.all([
+    Skin.findOne({ crt_time: { $gt: '' } }).sort({ crt_time: -1 }).lean(),
+    Skin.findOne({ testTime: { $gt: '' } }).sort({ testTime: -1 }).lean(),
+    Skin.findOne({ scrapedAt: { $exists: true } }).sort({ scrapedAt: -1 }).lean()
+  ]);
+
+  const candidates = [];
+
+  if (latestByCrt?.crt_time) {
+    const parsed = parseDateInTimezone(latestByCrt.crt_time, cfg.sourceTimezone) || parseDateInput(latestByCrt.crt_time);
+    if (parsed && !Number.isNaN(parsed.getTime())) {
+      candidates.push({ sourceField: 'crt_time', latestRaw: latestByCrt.crt_time, latestDate: parsed });
+    }
+  }
+
+  if (latestByTest?.testTime) {
+    const parsed = parseDateInTimezone(latestByTest.testTime, cfg.sourceTimezone) || parseDateInput(latestByTest.testTime);
+    if (parsed && !Number.isNaN(parsed.getTime())) {
+      candidates.push({ sourceField: 'testTime', latestRaw: latestByTest.testTime, latestDate: parsed });
+    }
+  }
+
+  if (latestByScrapedAt?.scrapedAt) {
+    const parsed = latestByScrapedAt.scrapedAt instanceof Date
+      ? latestByScrapedAt.scrapedAt
+      : parseDateInput(latestByScrapedAt.scrapedAt);
+    if (parsed && !Number.isNaN(parsed.getTime())) {
+      candidates.push({ sourceField: 'scrapedAt', latestRaw: latestByScrapedAt.scrapedAt, latestDate: parsed });
+    }
+  }
+
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.latestDate.getTime() - a.latestDate.getTime());
+  return candidates[0];
+};
+
+const buildIncrementalSyncRange = async (now = new Date()) => {
+  const anchor = await getLatestRecordAnchor();
+  if (!anchor?.latestDate) return null;
+  const rangeStartDate = new Date(anchor.latestDate.getTime() + 60 * 1000);
+  if (rangeStartDate.getTime() > now.getTime()) {
+    return {
+      invalid: true,
+      anchor,
+      rangeStartDate,
+      rangeEndDate: now
+    };
+  }
+  const rangeTimezone = cfg.sourceTimezone || cfg.syncTimezone || 'Asia/Ho_Chi_Minh';
+  return {
+    invalid: false,
+    anchor,
+    rangeStartDate,
+    rangeEndDate: now,
+    rangeStart: formatDateTimeInTimezone(rangeStartDate, rangeTimezone),
+    rangeEnd: formatDateTimeInTimezone(now, rangeTimezone)
+  };
+};
+
 const rangeKey = (rangeStart, rangeEnd) => `range:${rangeStart || 'none'}:${rangeEnd || 'none'}`;
 
 const buildRangeQuery = (rangeStart, rangeEnd, field = 'scrapedAt') => {
@@ -718,6 +787,10 @@ app.post('/api/scrape/full-sync', async (req, res) => {
   const inputStart = req.query.start ?? req.body?.start ?? req.query.from ?? req.body?.from ?? null;
   const inputEnd = req.query.end ?? req.body?.end ?? req.query.to ?? req.body?.to ?? null;
   const incremental = (req.query.incremental ?? req.body?.incremental ?? 'false').toString() === 'true';
+  const responseDataMode = String(
+    req.query.responseDataMode ?? req.body?.responseDataMode ?? 'range'
+  ).toLowerCase();
+  const responseRangeField = normalizeRangeField(req.query.rangeField || req.body?.rangeField || DEFAULT_RANGE_FIELD);
   const headerToken =
     req.headers['x-access-token'] ||
     req.headers['access-token'] ||
@@ -743,25 +816,28 @@ app.post('/api/scrape/full-sync', async (req, res) => {
     accessToken: maskToken(requestToken)
   });
 
-  let rangeStart = normalizeDateInput(inputStart, false);
-  let rangeEnd = normalizeDateInput(inputEnd, true);
+  const requestedRangeStart = normalizeDateInput(inputStart, false);
+  const requestedRangeEnd = normalizeDateInput(inputEnd, true);
+  let rangeStart = requestedRangeStart;
+  let rangeEnd = requestedRangeEnd;
 
   if (incremental) {
-    const latestByCrt = await Skin.findOne({ crt_time: { $gt: '' } })
-      .sort({ crt_time: -1 })
-      .lean();
-    const latestByTest = !latestByCrt
-      ? await Skin.findOne({ testTime: { $gt: '' } }).sort({ testTime: -1 }).lean()
-      : null;
-    const latest = latestByCrt?.crt_time || latestByTest?.testTime || null;
-    if (!rangeStart && latest) {
-      const latestDate = parseDateInput(latest);
-      if (latestDate && !Number.isNaN(latestDate.getTime())) {
-        // Nhích lên 1 phút để tránh lấy trùng bản ghi đã có.
-        rangeStart = formatDateTime(new Date(latestDate.getTime() + 60 * 1000));
+    if (!rangeStart || !rangeEnd) {
+      const incrementalRange = await buildIncrementalSyncRange(new Date());
+      if (incrementalRange?.invalid) {
+        const timezone = cfg.syncTimezone || 'Asia/Ho_Chi_Minh';
+        return res.status(400).json({
+          success: false,
+          message: `Range incremental không hợp lệ (${formatDateTimeInTimezone(incrementalRange.rangeStartDate, timezone)} > ${formatDateTimeInTimezone(incrementalRange.rangeEndDate, timezone)})`
+        });
+      }
+      if (!rangeStart && incrementalRange?.rangeStart) {
+        rangeStart = incrementalRange.rangeStart;
+      }
+      if (!rangeEnd && incrementalRange?.rangeEnd) {
+        rangeEnd = incrementalRange.rangeEnd;
       }
     }
-    if (!rangeEnd) rangeEnd = formatDateTime(new Date());
     if (!rangeStart) {
       return res.status(400).json({
         success: false,
@@ -833,6 +909,20 @@ app.post('/api/scrape/full-sync', async (req, res) => {
     const dataTimeRange = await getDataTimeRange();
     const displayDataTimeRange = formatDataRangeForDisplay(dataTimeRange);
 
+    let responseData = items;
+    let responseRange = rangeStart && rangeEnd ? { start: rangeStart, end: rangeEnd } : null;
+    if (save && responseDataMode !== 'scraped') {
+      const preferredRangeStart = requestedRangeStart || rangeStart;
+      const preferredRangeEnd = requestedRangeEnd || rangeEnd;
+      const responseFilter = buildRangeQuery(preferredRangeStart, preferredRangeEnd, responseRangeField);
+      responseData = await Skin.find(responseFilter || {})
+        .sort({ [responseRangeField]: -1 })
+        .lean();
+      if (preferredRangeStart && preferredRangeEnd) {
+        responseRange = { start: preferredRangeStart, end: preferredRangeEnd };
+      }
+    }
+
     return res.json({
       success: true,
       saved: save,
@@ -841,12 +931,16 @@ app.post('/api/scrape/full-sync', async (req, res) => {
       updatedCount: save ? updatedCount : 0,
       unchangedCount: save ? unchangedCount : 0,
       total: items.length,
-      range: rangeStart && rangeEnd ? { start: rangeStart, end: rangeEnd } : null,
+      totalView: responseData.length,
+      rangeField: responseRangeField,
+      responseDataMode: save && responseDataMode !== 'scraped' ? 'range' : 'scraped',
+      range: responseRange,
       incremental,
       stats: {
         dataTimeRange: displayDataTimeRange
       },
-      data: items
+      data: responseData,
+      scrapedData: items
     });
   } catch (error) {
     scrapingStatus.isRunning = false;
@@ -932,11 +1026,11 @@ app.post('/api/sync/request', async (req, res) => {
  * GET /api/data
  * Lấy dữ liệu từ MongoDB
  * Query params:
- *   - page: số trang (default: 1)
- *   - limit: số items mỗi trang (default: 50, max: 500)
- *   - search: tìm kiếm (tìm trong id, customerInfo, account, deviceNumber)
- *   - sortBy: sắp xếp theo field (default: scrapedAt)
- *   - sortOrder: asc hoặc desc (default: desc)
+  *   - page: số trang (default: 1)
+  *   - limit: số items mỗi trang (default: 50, max: 500)
+  *   - search: tìm kiếm (tìm trong id, customerInfo, account, deviceNumber)
+ *   - sortBy: sắp xếp theo field (default: rangeField)
+  *   - sortOrder: asc hoặc desc (default: desc)
  */
 app.get('/api/data', async (req, res) => {
   try {
@@ -949,6 +1043,7 @@ app.get('/api/data', async (req, res) => {
     const search = req.query.search || '';
     const sortByArg = (req.query.sortBy || '').trim();
     const sortOrder = req.query.sortOrder === 'asc' ? 1 : -1;
+    const refresh = String(req.query.refresh ?? req.query.sync ?? 'false').toLowerCase() === 'true';
     const inputStart = req.query.start ?? req.query.from ?? null;
     const inputEnd = req.query.end ?? req.query.to ?? null;
     const rangeStart = normalizeDateInput(inputStart, false);
@@ -968,9 +1063,8 @@ app.get('/api/data', async (req, res) => {
       bearerToken ||
       headerToken ||
       '';
-    const rangeField = (req.query.rangeField || req.query.field || 'scrapedAt').trim();
-    const allowedFields = ['scrapedAt', 'crt_time'];
-    const normalizedRangeField = allowedFields.includes(rangeField) ? rangeField : 'scrapedAt';
+    const rangeField = req.query.rangeField || req.query.field || DEFAULT_RANGE_FIELD;
+    const normalizedRangeField = normalizeRangeField(rangeField);
     const rangeFilter = buildRangeQuery(rangeStart, rangeEnd, normalizedRangeField);
 
     // Build query
@@ -994,7 +1088,7 @@ app.get('/api/data', async (req, res) => {
     const total = await Skin.countDocuments(query);
 
     // Get data
-    const resolvedSortField = allowedFields.includes(sortByArg) ? sortByArg : normalizedRangeField;
+    const resolvedSortField = ALLOWED_RANGE_FIELDS.includes(sortByArg) ? sortByArg : normalizedRangeField;
     let dataQuery = Skin.find(query).sort({ [resolvedSortField]: sortOrder });
     if (!(unlimitedRequest)) {
       dataQuery = dataQuery.skip(skip).limit(resolvedLimit);
@@ -1088,6 +1182,1376 @@ app.get('/api/data', async (req, res) => {
 });
 
 /**
+ * GET /api/customers
+ * Truy vấn dữ liệu khách hàng từ collection skins (không thay đổi API cũ).
+ * Query params:
+ *   - page: số trang (default: 1)
+ *   - limit: số items mỗi trang (default: 50, max: 500)
+ *   - noLimit=true: trả toàn bộ kết quả khớp filter
+ *   - search: tìm kiếm theo tên/sđt/id/account
+ *   - start/end hoặc from/to: lọc theo rangeField
+ *   - rangeField: scrapedAt|crt_time (default: crt_time)
+ *   - sortBy: field sắp xếp
+ *   - sortOrder: asc|desc
+ *   - includeAnalysisRaw=true: trả thêm analysis raw
+ */
+app.get('/api/customers', async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+    const parsedLimit = Number.isNaN(Number(req.query.limit)) ? null : Number(req.query.limit);
+    const noLimitFlag = String(req.query.noLimit ?? req.query.unlimited ?? 'false').toLowerCase() === 'true';
+    const unlimitedRequest = noLimitFlag || (parsedLimit !== null && parsedLimit <= 0);
+    const resolvedLimit = unlimitedRequest ? null : Math.min(parsedLimit ?? 50, 500);
+    const skip = unlimitedRequest ? 0 : (page - 1) * resolvedLimit;
+    const search = String(req.query.search || '').trim();
+    const sortByArg = String(req.query.sortBy || '').trim();
+    const sortOrder = req.query.sortOrder === 'asc' ? 1 : -1;
+    const includeAnalysisRaw = String(req.query.includeAnalysisRaw || 'false').toLowerCase() === 'true';
+
+    const inputStart = req.query.start ?? req.query.from ?? null;
+    const inputEnd = req.query.end ?? req.query.to ?? null;
+    const rangeStart = normalizeDateInput(inputStart, false);
+    const rangeEnd = normalizeDateInput(inputEnd, true);
+    const rangeField = req.query.rangeField || req.query.field || DEFAULT_RANGE_FIELD;
+    const normalizedRangeField = normalizeRangeField(rangeField);
+    const rangeFilter = buildRangeQuery(rangeStart, rangeEnd, normalizedRangeField);
+
+    const queryParts = [];
+    if (search) {
+      queryParts.push({
+        $or: [
+          { customer_nickname: { $regex: search, $options: 'i' } },
+          { customer_mobile: { $regex: search, $options: 'i' } },
+          { customerInfo: { $regex: search, $options: 'i' } },
+          { id: { $regex: search, $options: 'i' } },
+          { user_acct: { $regex: search, $options: 'i' } },
+          { account: { $regex: search, $options: 'i' } }
+        ]
+      });
+    }
+    if (rangeFilter) queryParts.push(rangeFilter);
+    const query = queryParts.length === 0
+      ? {}
+      : (queryParts.length === 1 ? queryParts[0] : { $and: queryParts });
+
+    const total = await Skin.countDocuments(query);
+
+    const sortableFields = new Set([
+      'customer_nickname',
+      'customer_mobile',
+      'customer_age',
+      'customer_birthday',
+      'customer_sex',
+      'user_acct',
+      'account',
+      'id',
+      'createdAt',
+      'updatedAt',
+      'scrapedAt',
+      'crt_time'
+    ]);
+    const resolvedSortField = sortableFields.has(sortByArg) ? sortByArg : normalizedRangeField;
+
+    const analysisProjection = includeAnalysisRaw
+      ? { analysis: 1 }
+      : {
+          'analysis.skin_type': 1,
+          'analysis.ext_water': 1,
+          'analysis.collagen': 1,
+          'analysis.pore': 1,
+          'analysis.spot': 1,
+          'analysis.wrinkle': 1,
+          'analysis.acne': 1,
+          'analysis.blackhead': 1,
+          'analysis.dark_circle': 1,
+          'analysis.pockmark': 1,
+          'analysis.uv_spot': 1,
+          'analysis.final_result': 1
+        };
+
+    const projection = {
+      _id: 0,
+      id: 1,
+      result_id: 1,
+      code: 1,
+      customer_nickname: 1,
+      customer_mobile: 1,
+      customer_sex: 1,
+      customer_age: 1,
+      customer_birthday: 1,
+      customer_location: 1,
+      customer_level: 1,
+      customer_comments: 1,
+      customer_introducer: 1,
+      customerInfo: 1,
+      gender: 1,
+      user_acct: 1,
+      account: 1,
+      status: 1,
+      result_type: 1,
+      score: 1,
+      crt_time: 1,
+      scrapedAt: 1,
+      createdAt: 1,
+      updatedAt: 1,
+      recommendedGoodsIds: 1,
+      recommendedGoods: 1,
+      ...analysisProjection
+    };
+
+    let dataQuery = Skin.find(query, projection).sort({ [resolvedSortField]: sortOrder });
+    if (!unlimitedRequest) {
+      dataQuery = dataQuery.skip(skip).limit(resolvedLimit);
+    }
+    const docs = await dataQuery.lean();
+
+    const pickSkinMetric = (node) => {
+      if (!node || typeof node !== 'object') return null;
+      return {
+        score: node.score ?? null,
+        level: node.level ?? null,
+        type: node.type ?? null,
+        result: node.result ?? null,
+        count: node.count ?? null
+      };
+    };
+
+    const toGoodsIdList = (value) => {
+      if (!value) return [];
+      if (Array.isArray(value)) {
+        return value
+          .map((v) => String(v || '').trim())
+          .filter(Boolean);
+      }
+      if (typeof value === 'string') {
+        return value
+          .split(',')
+          .map((v) => v.trim())
+          .filter(Boolean);
+      }
+      return [];
+    };
+
+    const data = docs.map((doc) => {
+      const analysis = doc.analysis || {};
+      const finalResult = analysis.final_result || {};
+      const goodsIds = Array.from(
+        new Set([
+          ...toGoodsIdList(doc.recommendedGoodsIds),
+          ...toGoodsIdList(finalResult.goods)
+        ])
+      );
+
+      return {
+        customerId: doc.id || doc.result_id || null,
+        code: doc.code || null,
+        name: doc.customer_nickname || doc.customerInfo || null,
+        mobile: doc.customer_mobile || null,
+        sex: doc.customer_sex ?? doc.gender ?? null,
+        age: doc.customer_age ?? null,
+        birthday: doc.customer_birthday || null,
+        location: doc.customer_location || null,
+        level: doc.customer_level || null,
+        comments: doc.customer_comments || null,
+        introducer: doc.customer_introducer || null,
+        account: doc.user_acct || doc.account || null,
+        status: doc.status ?? null,
+        resultType: doc.result_type ?? null,
+        score: doc.score ?? null,
+        skinCondition: {
+          overview: {
+            skinType: analysis?.skin_type?.type || finalResult?.skin_result || null,
+            hydrationLevel: analysis?.ext_water?.level ?? null,
+            hydrationScore: analysis?.ext_water?.score ?? analysis?.ext_water?.result ?? null,
+            collagenLevel: analysis?.collagen?.level ?? null,
+            collagenScore: analysis?.collagen?.score ?? null
+          },
+          metrics: {
+            sebum: pickSkinMetric(analysis?.skin_type),
+            hydration: pickSkinMetric(analysis?.ext_water),
+            pores: pickSkinMetric(analysis?.pore),
+            spots: pickSkinMetric(analysis?.spot),
+            wrinkles: pickSkinMetric(analysis?.wrinkle),
+            acne: pickSkinMetric(analysis?.acne),
+            blackheads: pickSkinMetric(analysis?.blackhead),
+            darkCircles: pickSkinMetric(analysis?.dark_circle),
+            collagen: pickSkinMetric(analysis?.collagen),
+            pockmark: pickSkinMetric(analysis?.pockmark),
+            uvSpot: pickSkinMetric(analysis?.uv_spot)
+          }
+        },
+        recommendedProducts: {
+          ids: goodsIds,
+          items: Array.isArray(doc.recommendedGoods) ? doc.recommendedGoods : []
+        },
+        times: {
+          crt_time: doc.crt_time || null,
+          scrapedAt: doc.scrapedAt || null,
+          createdAt: doc.createdAt || null,
+          updatedAt: doc.updatedAt || null
+        },
+        ...(includeAnalysisRaw ? { analysis: doc.analysis || null } : {})
+      };
+    });
+
+    const dataTimeRange = await getDataTimeRange(rangeFilter, normalizedRangeField);
+    const displayDataTimeRange = formatDataRangeForDisplay(dataTimeRange);
+
+    return res.json({
+      success: true,
+      rangeField: normalizedRangeField,
+      filters: {
+        search: search || null,
+        start: rangeStart || null,
+        end: rangeEnd || null
+      },
+      stats: {
+        dataTimeRange: displayDataTimeRange
+      },
+      data,
+      pagination: unlimitedRequest
+        ? {
+            page: 1,
+            limit: total,
+            total,
+            totalPages: 1,
+            hasNext: false,
+            hasPrev: false
+          }
+        : {
+            page,
+            limit: resolvedLimit,
+            total,
+            totalPages: Math.ceil(total / resolvedLimit),
+            hasNext: page * resolvedLimit < total,
+            hasPrev: page > 1
+          }
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+});
+
+const SKIN_RANGE_FIELDS = new Set(['crt_time', 'test_time', 'createdAt']);
+const SKIN_SORT_FIELDS = new Set([
+  'id',
+  'result_id',
+  'code',
+  'status',
+  'crt_time',
+  'test_time',
+  'createdAt',
+  'updatedAt',
+  'customer_nickname',
+  'customer_mobile',
+  'customer_sex',
+  'customer_age',
+  'user_acct'
+]);
+const SUMMARY_CACHE_TTL_MS = Math.max(30000, Number(process.env.SUMMARY_CACHE_TTL_MS || 60000));
+const skinSummaryCache = new Map();
+
+const sendApiError = (res, status, message, errorCode, details = null) => {
+  return res.status(status).json({
+    success: false,
+    message,
+    errorCode,
+    details
+  });
+};
+
+const parseDayRangeQuery = (from, to, rangeField) => {
+  const rangeStartText = `${from} 00:00:00`;
+  const rangeEndText = `${to} 23:59:59`;
+  if (rangeField === 'createdAt') {
+    return {
+      createdAt: {
+        $gte: new Date(`${from}T00:00:00.000Z`),
+        $lte: new Date(`${to}T23:59:59.999Z`)
+      }
+    };
+  }
+  if (rangeField === 'test_time') {
+    return {
+      $or: [
+        { test_time: { $gte: rangeStartText, $lte: rangeEndText } },
+        { testTime: { $gte: rangeStartText, $lte: rangeEndText } }
+      ]
+    };
+  }
+  return { crt_time: { $gte: rangeStartText, $lte: rangeEndText } };
+};
+
+const parseSkinRecordsQuery = (req) => {
+  const from = String(req.query.from || '').trim();
+  const to = String(req.query.to || '').trim();
+  const rangeFieldRaw = String(req.query.rangeField || 'crt_time').trim();
+  const rangeField = SKIN_RANGE_FIELDS.has(rangeFieldRaw) ? rangeFieldRaw : 'crt_time';
+  const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+  if (!from || !to) {
+    return { error: { status: 400, message: 'Missing required query params: from, to', code: 'INVALID_QUERY' } };
+  }
+  if (!datePattern.test(from) || !datePattern.test(to)) {
+    return { error: { status: 400, message: 'Invalid date format. Expected YYYY-MM-DD for from/to.', code: 'INVALID_QUERY' } };
+  }
+  if (from > to) {
+    return { error: { status: 400, message: '`from` must be less than or equal to `to`.', code: 'INVALID_QUERY' } };
+  }
+
+  const pageRaw = req.query.page;
+  const page = pageRaw == null ? 1 : Number(pageRaw);
+  if (!Number.isFinite(page) || page < 1) {
+    return { error: { status: 400, message: 'Invalid page. page must be >= 1.', code: 'INVALID_QUERY' } };
+  }
+
+  const pageSizeRaw = req.query.pageSize;
+  const pageSize = pageSizeRaw == null ? 100 : Number(pageSizeRaw);
+  if (!Number.isFinite(pageSize) || pageSize < 1 || pageSize > 500) {
+    return { error: { status: 400, message: 'Invalid pageSize. pageSize must be in range 1..500.', code: 'INVALID_QUERY' } };
+  }
+
+  const sortOrderRaw = String(req.query.sortOrder || 'desc').toLowerCase();
+  if (!['asc', 'desc'].includes(sortOrderRaw)) {
+    return { error: { status: 400, message: 'Invalid sortOrder. Allowed: asc|desc.', code: 'INVALID_QUERY' } };
+  }
+  const sortOrder = sortOrderRaw === 'asc' ? 1 : -1;
+
+  const sortByRaw = String(req.query.sortBy || 'crt_time').trim();
+  const sortBy = SKIN_SORT_FIELDS.has(sortByRaw) ? sortByRaw : 'crt_time';
+
+  return {
+    value: {
+      from,
+      to,
+      rangeField,
+      page: Number(page),
+      pageSize: Number(pageSize),
+      sortBy,
+      sortOrder
+    }
+  };
+};
+
+const toGoodsIdList = (value) => {
+  if (!value) return [];
+  if (Array.isArray(value)) {
+    return value.map((v) => String(v || '').trim()).filter(Boolean);
+  }
+  if (typeof value === 'string') {
+    return value.split(',').map((v) => v.trim()).filter(Boolean);
+  }
+  return [];
+};
+
+const buildTopGoodsFromCounts = (goodsCounts, totalRecords, limit = 20) => {
+  const safeTotal = Number.isFinite(totalRecords) && totalRecords > 0 ? totalRecords : 0;
+  const items = [];
+
+  for (const [rawLabel, rawCount] of goodsCounts.entries()) {
+    const label = String(rawLabel ?? '').trim();
+    if (!label) continue;
+    const count = Number(rawCount);
+    if (!Number.isFinite(count) || count < 0) continue;
+    if (safeTotal > 0 && count > safeTotal) continue;
+
+    let percent = safeTotal > 0 ? Number(((count * 100) / safeTotal).toFixed(2)) : 0;
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+
+    const expected = safeTotal > 0 ? (count * 100) / safeTotal : 0;
+    if (Math.abs(percent - expected) > 0.1) {
+      percent = Number(expected.toFixed(2));
+    }
+
+    items.push({ label, count, percent });
+  }
+
+  return items
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label))
+    .slice(0, limit);
+};
+
+const MULTI_USE_MODULE_KEYS = [
+  'skin_type',
+  'ext_water',
+  'pore',
+  'spot',
+  'wrinkle',
+  'acne',
+  'blackhead',
+  'dark_circle',
+  'collagen',
+  'pockmark',
+  'uv_spot'
+];
+
+const buildModuleGoodsMap = (analysis) => {
+  const safeAnalysis = (analysis && typeof analysis === 'object') ? analysis : {};
+  const moduleGoodsMap = new Map();
+  for (const moduleKey of MULTI_USE_MODULE_KEYS) {
+    const goodsSet = new Set(toGoodsIdList(safeAnalysis?.[moduleKey]?.goods));
+    if (goodsSet.size > 0) {
+      moduleGoodsMap.set(moduleKey, goodsSet);
+    }
+  }
+  return moduleGoodsMap;
+};
+
+const addMultiUseStatsFromRecord = (analysis, recordCountMap, moduleSetMap) => {
+  const moduleGoodsMap = buildModuleGoodsMap(analysis);
+  if (moduleGoodsMap.size === 0) return;
+
+  // Count each goods code at most once per record; keep module set for multi-use check.
+  const recordGoodsModules = new Map();
+  for (const [moduleKey, goodsSet] of moduleGoodsMap.entries()) {
+    for (const goodsCode of goodsSet) {
+      if (!recordGoodsModules.has(goodsCode)) {
+        recordGoodsModules.set(goodsCode, new Set());
+      }
+      recordGoodsModules.get(goodsCode).add(moduleKey);
+    }
+  }
+
+  for (const [goodsCode, modulesInRecord] of recordGoodsModules.entries()) {
+    recordCountMap.set(goodsCode, (recordCountMap.get(goodsCode) || 0) + 1);
+    if (!moduleSetMap.has(goodsCode)) {
+      moduleSetMap.set(goodsCode, new Set());
+    }
+    const modules = moduleSetMap.get(goodsCode);
+    for (const moduleKey of modulesInRecord) {
+      modules.add(moduleKey);
+    }
+  }
+};
+
+const normalizeTopMultiUseGoods = (items, totalRecords, contextLabel = 'unknown') => {
+  const safeTotal = Number.isFinite(totalRecords) && totalRecords > 0 ? totalRecords : 0;
+  return (Array.isArray(items) ? items : [])
+    .map((item) => {
+      const label = String(item?.label ?? item?.id ?? '').trim();
+      if (!label) return null;
+      const rawCount = Number(item?.count);
+      const boundedCount = Number.isFinite(rawCount)
+        ? Math.max(0, Math.min(rawCount, safeTotal))
+        : 0;
+      const percent = safeTotal > 0 ? Number(((boundedCount * 100) / safeTotal).toFixed(2)) : 0;
+      const modules = Array.isArray(item?.modules)
+        ? Array.from(new Set(item.modules.map((m) => String(m || '').trim()).filter(Boolean)))
+        : [];
+      if (rawCount > safeTotal || (item?.percent != null && Number(item.percent) > 100)) {
+        console.warn(
+          `[${contextLabel}] normalized topMultiUseGoods anomaly: label=${label}, rawCount=${rawCount}, totalRecords=${safeTotal}, rawPercent=${item?.percent}`
+        );
+      }
+      return {
+        label,
+        count: boundedCount,
+        percent,
+        ...(modules.length > 0 ? { modules } : {})
+      };
+    })
+    .filter(Boolean);
+};
+
+const normalizeListRecord = (doc) => {
+  const analysis = (doc.analysis && typeof doc.analysis === 'object') ? doc.analysis : {};
+  return {
+    id: doc.id ?? null,
+    result_id: doc.result_id ?? null,
+    code: doc.code ?? null,
+    status: doc.status ?? null,
+    crt_time: doc.crt_time ?? null,
+    test_time: doc.test_time ?? doc.testTime ?? null,
+    createdAt: doc.createdAt ?? null,
+    updatedAt: doc.updatedAt ?? null,
+    image: doc.image ?? null,
+    user_acct: doc.user_acct ?? null,
+    customer_nickname: doc.customer_nickname ?? null,
+    customer_sex: doc.customer_sex ?? null,
+    customer_age: doc.customer_age ?? null,
+    customer_mobile: doc.customer_mobile ?? null,
+    analysis: {
+      age: analysis.age || null,
+      final_result: analysis.final_result || null
+    }
+  };
+};
+
+const normalizeDetailRecord = (doc) => {
+  const analysis = (doc.analysis && typeof doc.analysis === 'object') ? doc.analysis : {};
+  return {
+    id: doc.id ?? null,
+    result_id: doc.result_id ?? null,
+    code: doc.code ?? null,
+    status: doc.status ?? null,
+    crt_time: doc.crt_time ?? null,
+    test_time: doc.test_time ?? doc.testTime ?? null,
+    createdAt: doc.createdAt ?? null,
+    updatedAt: doc.updatedAt ?? null,
+    image: doc.image ?? null,
+    user_acct: doc.user_acct ?? null,
+    customer_nickname: doc.customer_nickname ?? null,
+    customer_sex: doc.customer_sex ?? null,
+    customer_age: doc.customer_age ?? null,
+    customer_mobile: doc.customer_mobile ?? null,
+    recommendedGoodsIds: Array.from(
+      new Set([
+        ...toGoodsIdList(doc.recommendedGoodsIds),
+        ...toGoodsIdList(analysis?.final_result?.goods)
+      ])
+    ),
+    recommendedGoods: Array.isArray(doc.recommendedGoods) ? doc.recommendedGoods : [],
+    analysis
+  };
+};
+
+const getSummaryCache = (key) => {
+  const cached = skinSummaryCache.get(key);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    skinSummaryCache.delete(key);
+    return null;
+  }
+  return cached.payload;
+};
+
+const setSummaryCache = (key, payload) => {
+  skinSummaryCache.set(key, {
+    payload,
+    expiresAt: Date.now() + SUMMARY_CACHE_TTL_MS
+  });
+};
+
+/**
+ * GET /api/skin-report/summary
+ * Aggregated data for dashboard overview.
+ */
+app.get('/api/skin-report/summary', async (req, res) => {
+  const parsed = parseSkinRecordsQuery(req);
+  if (parsed.error) {
+    return sendApiError(res, parsed.error.status, parsed.error.message, parsed.error.code);
+  }
+  const { from, to, rangeField } = parsed.value;
+
+  try {
+    const cacheKey = JSON.stringify({ from, to, rangeField });
+    const cached = getSummaryCache(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    const rangeQuery = parseDayRangeQuery(from, to, rangeField);
+    const projection = {
+      customer_sex: 1,
+      customer_age: 1,
+      customer_mobile: 1,
+      analysis: 1,
+      recommendedGoodsIds: 1
+    };
+
+    const docs = await Skin.find(rangeQuery, projection).lean();
+    const totalRecords = docs.length;
+
+    const ageValues = [];
+    const reportedAgeValues = [];
+    const predictedAgeValues = [];
+    const sexCounts = new Map();
+    const skinTypeCounts = new Map();
+    const severityCounters = {
+      acne: new Map(),
+      pore: new Map(),
+      spot: new Map(),
+      wrinkle: new Map()
+    };
+    const darkCircleTypeCounts = new Map();
+    const sensitivityCounts = new Map();
+    const multiUseRecordCounts = new Map();
+    const canonicalTopGoodsCounts = new Map();
+    const multiUseModules = new Map();
+
+    let totalWithReportedAge = 0;
+    let totalWithPredictedAge = 0;
+    let ageGapSum = 0;
+    let ageGapCount = 0;
+    let mismatchCount = 0;
+    let withPhoneCount = 0;
+
+    const toNumber = (value) => {
+      if (value == null || value === '') return null;
+      const parsedNum = Number(value);
+      return Number.isFinite(parsedNum) ? parsedNum : null;
+    };
+    const addCount = (bucket, rawKey, inc = 1) => {
+      const key = String(rawKey ?? 'unknown').trim() || 'unknown';
+      bucket.set(key, (bucket.get(key) || 0) + inc);
+    };
+    for (const doc of docs) {
+      const analysis = (doc.analysis && typeof doc.analysis === 'object') ? doc.analysis : {};
+      const canonicalGoods = new Set(toGoodsIdList(analysis?.final_result?.goods));
+      const reportedAge = toNumber(doc.customer_age);
+      const predictedAge = toNumber(analysis?.age?.result ?? analysis?.final_result?.age);
+      const chosenAge = predictedAge ?? reportedAge;
+
+      if (reportedAge != null) {
+        totalWithReportedAge += 1;
+        reportedAgeValues.push(reportedAge);
+      }
+      if (predictedAge != null) {
+        totalWithPredictedAge += 1;
+        predictedAgeValues.push(predictedAge);
+      }
+      if (chosenAge != null) ageValues.push(chosenAge);
+
+      if (reportedAge != null && predictedAge != null) {
+        const gap = Math.abs(predictedAge - reportedAge);
+        ageGapSum += gap;
+        ageGapCount += 1;
+        if (gap >= 5) mismatchCount += 1;
+      }
+
+      if (doc.customer_mobile && String(doc.customer_mobile).trim()) {
+        withPhoneCount += 1;
+      }
+
+      addCount(sexCounts, doc.customer_sex ?? 'unknown');
+      addCount(skinTypeCounts, analysis?.skin_type?.type ?? analysis?.final_result?.skin_result ?? 'unknown');
+      addCount(darkCircleTypeCounts, analysis?.dark_circle?.type ?? 'unknown');
+      addCount(sensitivityCounts, analysis?.sensitive?.type ?? 'unknown');
+      addMultiUseStatsFromRecord(analysis, multiUseRecordCounts, multiUseModules);
+
+      for (const key of ['acne', 'pore', 'spot', 'wrinkle']) {
+        const level = analysis?.[key]?.level ?? 'unknown';
+        addCount(severityCounters[key], level);
+      }
+      for (const gid of canonicalGoods) {
+        canonicalTopGoodsCounts.set(gid, (canonicalTopGoodsCounts.get(gid) || 0) + 1);
+      }
+    }
+
+    ageValues.sort((a, b) => a - b);
+    const ageCount = ageValues.length;
+    const ageAverage = ageCount ? ageValues.reduce((sum, v) => sum + v, 0) / ageCount : null;
+    const median = ageCount
+      ? (ageCount % 2 === 0
+          ? (ageValues[(ageCount / 2) - 1] + ageValues[ageCount / 2]) / 2
+          : ageValues[Math.floor(ageCount / 2)])
+      : null;
+
+    const toDistribution = (bucket) => {
+      const list = Array.from(bucket.entries())
+        .map(([label, count]) => ({
+          label,
+          count,
+          percent: totalRecords > 0 ? Number(((count * 100) / totalRecords).toFixed(2)) : 0
+        }))
+        .sort((a, b) => b.count - a.count);
+      return list;
+    };
+    const toSeverityDistribution = (bucket) => {
+      return Array.from(bucket.entries())
+        .map(([label, count]) => ({
+          label: String(label),
+          count,
+          percent: totalRecords > 0 ? Number(((count * 100) / totalRecords).toFixed(2)) : 0
+        }))
+        .sort((a, b) => b.count - a.count);
+    };
+
+    const topGoods = buildTopGoodsFromCounts(canonicalTopGoodsCounts, totalRecords, 20);
+
+    const rawMultiUseGoods = Array.from(multiUseModules.entries())
+      .filter(([, modules]) => modules.size >= 2)
+      .map(([id, modules]) => ({
+        id,
+        modules: Array.from(modules).sort(),
+        moduleCount: modules.size,
+        count: multiUseRecordCounts.get(id) || 0
+      }))
+      .sort((a, b) => b.moduleCount - a.moduleCount || b.count - a.count)
+      .slice(0, 50);
+    const multiUseGoods = normalizeTopMultiUseGoods(rawMultiUseGoods, totalRecords, 'summary');
+
+    const response = {
+      success: true,
+      message: 'OK',
+      meta: {
+        from,
+        to,
+        rangeField,
+        totalRecords,
+        generatedAt: new Date().toISOString()
+      },
+      data: {
+        totalRecords,
+        generatedAt: new Date().toISOString(),
+        age: {
+          count: ageCount,
+          average: ageAverage == null ? null : Number(ageAverage.toFixed(2)),
+          median: median == null ? null : Number(median.toFixed(2)),
+          min: ageCount ? ageValues[0] : null,
+          max: ageCount ? ageValues[ageCount - 1] : null
+        },
+        sexDistribution: toDistribution(sexCounts),
+        skinTypes: toDistribution(skinTypeCounts),
+        severity: {
+          acne: toSeverityDistribution(severityCounters.acne),
+          pore: toSeverityDistribution(severityCounters.pore),
+          spot: toSeverityDistribution(severityCounters.spot),
+          wrinkle: toSeverityDistribution(severityCounters.wrinkle)
+        },
+        darkCircleTypes: toDistribution(darkCircleTypeCounts),
+        sensitivity: toDistribution(sensitivityCounts),
+        topGoods,
+        dataQuality: {
+          totalWithReportedAge,
+          totalWithPredictedAge,
+          averageAgeGap: ageGapCount ? Number((ageGapSum / ageGapCount).toFixed(2)) : null,
+          mismatchCount,
+          mismatchShare: ageGapCount ? Number(((mismatchCount * 100) / ageGapCount).toFixed(2)) : 0,
+          withPhoneCount,
+          missingPhoneCount: Math.max(0, totalRecords - withPhoneCount)
+        },
+        issueTrends: {},
+        keyInsights: [],
+        multiUseGoods
+      }
+    };
+
+    setSummaryCache(cacheKey, response);
+    return res.json(response);
+  } catch (error) {
+    return sendApiError(res, 500, 'Internal server error', 'INTERNAL_ERROR', error?.message || null);
+  }
+});
+
+/**
+ * GET /api/skin-report/profile
+ * Tab "Nhân khẩu & loại da".
+ */
+app.get('/api/skin-report/profile', async (req, res) => {
+  const parsed = parseSkinRecordsQuery(req);
+  if (parsed.error) {
+    return sendApiError(res, parsed.error.status, parsed.error.message, parsed.error.code);
+  }
+  const { from, to, rangeField } = parsed.value;
+
+  try {
+    const docs = await Skin.find(
+      parseDayRangeQuery(from, to, rangeField),
+      {
+        _id: 0,
+        customer_sex: 1,
+        customer_age: 1,
+        analysis: 1
+      }
+    ).lean();
+
+    const totalRecords = docs.length;
+    const sexCounts = new Map();
+    const skinTypeCounts = new Map();
+    const ageBuckets = new Map([
+      ['<18', 0],
+      ['18-24', 0],
+      ['25-34', 0],
+      ['35-44', 0],
+      ['45-54', 0],
+      ['55+', 0],
+      ['unknown', 0]
+    ]);
+
+    const toNumber = (value) => {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    };
+    const addCount = (bucket, rawLabel) => {
+      const label = String(rawLabel ?? 'unknown').trim() || 'unknown';
+      bucket.set(label, (bucket.get(label) || 0) + 1);
+    };
+    const asDistribution = (bucket) => {
+      return Array.from(bucket.entries())
+        .map(([label, count]) => ({
+          label,
+          count,
+          percent: totalRecords > 0 ? Number(((count * 100) / totalRecords).toFixed(2)) : 0
+        }))
+        .sort((a, b) => b.count - a.count);
+    };
+
+    for (const doc of docs) {
+      const analysis = (doc.analysis && typeof doc.analysis === 'object') ? doc.analysis : {};
+      addCount(sexCounts, doc.customer_sex ?? 'unknown');
+      addCount(skinTypeCounts, analysis?.skin_type?.type ?? analysis?.final_result?.skin_result ?? 'unknown');
+
+      const predictedAge = toNumber(analysis?.age?.result ?? analysis?.final_result?.age);
+      const reportedAge = toNumber(doc.customer_age);
+      const age = predictedAge ?? reportedAge;
+      if (age == null) {
+        ageBuckets.set('unknown', (ageBuckets.get('unknown') || 0) + 1);
+      } else if (age < 18) {
+        ageBuckets.set('<18', (ageBuckets.get('<18') || 0) + 1);
+      } else if (age <= 24) {
+        ageBuckets.set('18-24', (ageBuckets.get('18-24') || 0) + 1);
+      } else if (age <= 34) {
+        ageBuckets.set('25-34', (ageBuckets.get('25-34') || 0) + 1);
+      } else if (age <= 44) {
+        ageBuckets.set('35-44', (ageBuckets.get('35-44') || 0) + 1);
+      } else if (age <= 54) {
+        ageBuckets.set('45-54', (ageBuckets.get('45-54') || 0) + 1);
+      } else {
+        ageBuckets.set('55+', (ageBuckets.get('55+') || 0) + 1);
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: 'OK',
+      meta: {
+        from,
+        to,
+        rangeField,
+        generatedAt: new Date().toISOString()
+      },
+      data: {
+        totalRecords,
+        sexDistribution: asDistribution(sexCounts),
+        skinTypes: asDistribution(skinTypeCounts),
+        ageBuckets: asDistribution(ageBuckets)
+      }
+    });
+  } catch (error) {
+    return sendApiError(res, 500, 'Internal server error', 'INTERNAL_ERROR', error?.message || null);
+  }
+});
+
+/**
+ * GET /api/skin-report/conditions
+ * Tab "Nhóm vấn đề da".
+ */
+app.get('/api/skin-report/conditions', async (req, res) => {
+  const parsed = parseSkinRecordsQuery(req);
+  if (parsed.error) {
+    return sendApiError(res, parsed.error.status, parsed.error.message, parsed.error.code);
+  }
+  const { from, to, rangeField } = parsed.value;
+
+  try {
+    const docs = await Skin.find(
+      parseDayRangeQuery(from, to, rangeField),
+      {
+        _id: 0,
+        customer_sex: 1,
+        analysis: 1
+      }
+    ).lean();
+    const totalRecords = docs.length;
+
+    const mainSeverityKeys = ['acne', 'pore', 'spot', 'wrinkle'];
+    const issueKeys = ['acne', 'pore', 'spot', 'wrinkle', 'blackhead', 'dark_circle', 'collagen', 'pockmark', 'uv_spot'];
+    const severity = {
+      acne: new Map(),
+      pore: new Map(),
+      spot: new Map(),
+      wrinkle: new Map()
+    };
+    const genderTotals = { all: totalRecords, male: 0, female: 0 };
+    const issueOccurrence = {};
+    const trendBucket = { high: 0, medium: 0, low: 0, scoreSum: 0, scoreCount: 0 };
+    const extWaterOccurrence = {
+      appearCount: 0,
+      share: 0,
+      maleCount: 0,
+      femaleCount: 0,
+      severeCount: 0,
+      severeShare: 0,
+      levelCounts: [0, 0, 0, 0, 0]
+    };
+    const extWaterTrend = { high: 0, medium: 0, low: 0, scoreSum: 0, scoreCount: 0 };
+
+    const toNumber = (value) => {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    };
+    const addLevel = (bucket, level) => {
+      const key = String(level ?? 'unknown');
+      bucket.set(key, (bucket.get(key) || 0) + 1);
+    };
+
+    for (const key of issueKeys) {
+      issueOccurrence[key] = {
+        appearCount: 0,
+        share: 0,
+        maleCount: 0,
+        femaleCount: 0,
+        severeCount: 0,
+        severeShare: 0,
+        levelCounts: [0, 0, 0, 0, 0]
+      };
+    }
+
+    for (const doc of docs) {
+      const analysis = (doc.analysis && typeof doc.analysis === 'object') ? doc.analysis : {};
+      const sex = Number(doc.customer_sex);
+      const isMale = sex === 1;
+      const isFemale = sex === 2;
+      if (isMale) genderTotals.male += 1;
+      if (isFemale) genderTotals.female += 1;
+
+      for (const key of issueKeys) {
+        const node = analysis?.[key];
+        if (!node || typeof node !== 'object') continue;
+        issueOccurrence[key].appearCount += 1;
+        if (isMale) issueOccurrence[key].maleCount += 1;
+        if (isFemale) issueOccurrence[key].femaleCount += 1;
+
+        const levelNum = toNumber(node.level);
+        if (levelNum != null && levelNum >= 1 && levelNum <= 5) {
+          issueOccurrence[key].levelCounts[levelNum - 1] += 1;
+          if (levelNum >= 4) issueOccurrence[key].severeCount += 1;
+          if (levelNum >= 4) trendBucket.high += 1;
+          else if (levelNum >= 2) trendBucket.medium += 1;
+          else trendBucket.low += 1;
+        }
+
+        const scoreNum = toNumber(node.score);
+        if (scoreNum != null) {
+          trendBucket.scoreSum += scoreNum;
+          trendBucket.scoreCount += 1;
+        }
+
+        if (mainSeverityKeys.includes(key)) {
+          addLevel(severity[key], levelNum ?? 'unknown');
+        }
+      }
+
+      const extNode = analysis?.ext_water;
+      if (extNode && typeof extNode === 'object') {
+        extWaterOccurrence.appearCount += 1;
+        if (isMale) extWaterOccurrence.maleCount += 1;
+        if (isFemale) extWaterOccurrence.femaleCount += 1;
+
+        const levelNum = toNumber(extNode.level);
+        if (levelNum != null && levelNum >= 1 && levelNum <= 5) {
+          extWaterOccurrence.levelCounts[levelNum - 1] += 1;
+          if (levelNum >= 4) extWaterOccurrence.severeCount += 1;
+          if (levelNum >= 4) extWaterTrend.high += 1;
+          else if (levelNum >= 2) extWaterTrend.medium += 1;
+          else extWaterTrend.low += 1;
+        }
+
+        const scoreNum = toNumber(extNode.score ?? extNode.result ?? extNode.level);
+        if (scoreNum != null) {
+          extWaterTrend.scoreSum += scoreNum;
+          extWaterTrend.scoreCount += 1;
+        }
+      }
+    }
+
+    for (const key of issueKeys) {
+      const row = issueOccurrence[key];
+      row.share = totalRecords > 0 ? Number(((row.appearCount * 100) / totalRecords).toFixed(2)) : 0;
+      row.severeShare = row.appearCount > 0 ? Number(((row.severeCount * 100) / row.appearCount).toFixed(2)) : 0;
+    }
+    extWaterOccurrence.share = totalRecords > 0
+      ? Number(((extWaterOccurrence.appearCount * 100) / totalRecords).toFixed(2))
+      : 0;
+    extWaterOccurrence.severeShare = extWaterOccurrence.appearCount > 0
+      ? Number(((extWaterOccurrence.severeCount * 100) / extWaterOccurrence.appearCount).toFixed(2))
+      : 0;
+
+    const toSeverityDist = (bucket) => {
+      return Array.from(bucket.entries())
+        .map(([label, count]) => ({
+          label: String(label),
+          count,
+          percent: totalRecords > 0 ? Number(((count * 100) / totalRecords).toFixed(2)) : 0
+        }))
+        .sort((a, b) => b.count - a.count);
+    };
+
+    const trendTotal = trendBucket.high + trendBucket.medium + trendBucket.low;
+    const issueTrends = {
+      highShare: trendTotal > 0 ? Number(((trendBucket.high * 100) / trendTotal).toFixed(2)) : 0,
+      mediumShare: trendTotal > 0 ? Number(((trendBucket.medium * 100) / trendTotal).toFixed(2)) : 0,
+      lowShare: trendTotal > 0 ? Number(((trendBucket.low * 100) / trendTotal).toFixed(2)) : 0,
+      averageScore: trendBucket.scoreCount > 0 ? Number((trendBucket.scoreSum / trendBucket.scoreCount).toFixed(2)) : null,
+      ext_water: {
+        highShare: (extWaterTrend.high + extWaterTrend.medium + extWaterTrend.low) > 0
+          ? Number(((extWaterTrend.high * 100) / (extWaterTrend.high + extWaterTrend.medium + extWaterTrend.low)).toFixed(2))
+          : 0,
+        mediumShare: (extWaterTrend.high + extWaterTrend.medium + extWaterTrend.low) > 0
+          ? Number(((extWaterTrend.medium * 100) / (extWaterTrend.high + extWaterTrend.medium + extWaterTrend.low)).toFixed(2))
+          : 0,
+        lowShare: (extWaterTrend.high + extWaterTrend.medium + extWaterTrend.low) > 0
+          ? Number(((extWaterTrend.low * 100) / (extWaterTrend.high + extWaterTrend.medium + extWaterTrend.low)).toFixed(2))
+          : 0,
+        averageScore: extWaterTrend.scoreCount > 0
+          ? Number((extWaterTrend.scoreSum / extWaterTrend.scoreCount).toFixed(2))
+          : null
+      }
+    };
+    issueOccurrence.ext_water = extWaterOccurrence;
+
+    return res.json({
+      success: true,
+      message: 'OK',
+      meta: {
+        from,
+        to,
+        rangeField,
+        generatedAt: new Date().toISOString()
+      },
+      data: {
+        severity: {
+          acne: toSeverityDist(severity.acne),
+          pore: toSeverityDist(severity.pore),
+          spot: toSeverityDist(severity.spot),
+          wrinkle: toSeverityDist(severity.wrinkle)
+        },
+        issueTrends,
+        issueOccurrence,
+        genderTotals
+      }
+    });
+  } catch (error) {
+    return sendApiError(res, 500, 'Internal server error', 'INTERNAL_ERROR', error?.message || null);
+  }
+});
+
+/**
+ * GET /api/skin-report/recommendations
+ * Tab "Đề xuất & KPI".
+ */
+app.get('/api/skin-report/recommendations', async (req, res) => {
+  const parsed = parseSkinRecordsQuery(req);
+  if (parsed.error) {
+    return sendApiError(res, parsed.error.status, parsed.error.message, parsed.error.code);
+  }
+  const { from, to, rangeField } = parsed.value;
+
+  try {
+    const docs = await Skin.find(
+      parseDayRangeQuery(from, to, rangeField),
+      {
+        _id: 0,
+        analysis: 1,
+        recommendedGoodsIds: 1
+      }
+    ).lean();
+
+    const totalRecords = docs.length;
+    const multiUseRecordCounts = new Map();
+    const canonicalTopGoodsCounts = new Map();
+    const multiUseModules = new Map();
+    const sensitivityCounts = new Map();
+    const darkCircleTypeCounts = new Map();
+    const trend = { high: 0, medium: 0, low: 0, scoreSum: 0, scoreCount: 0 };
+
+    const addCount = (bucket, rawLabel) => {
+      const label = String(rawLabel ?? 'unknown').trim() || 'unknown';
+      bucket.set(label, (bucket.get(label) || 0) + 1);
+    };
+    for (const doc of docs) {
+      const analysis = (doc.analysis && typeof doc.analysis === 'object') ? doc.analysis : {};
+      const canonicalGoods = new Set(toGoodsIdList(analysis?.final_result?.goods));
+      addCount(sensitivityCounts, analysis?.sensitive?.type ?? 'unknown');
+      addCount(darkCircleTypeCounts, analysis?.dark_circle?.type ?? 'unknown');
+      addMultiUseStatsFromRecord(analysis, multiUseRecordCounts, multiUseModules);
+
+      for (const gid of canonicalGoods) {
+        canonicalTopGoodsCounts.set(gid, (canonicalTopGoodsCounts.get(gid) || 0) + 1);
+      }
+
+      for (const key of ['acne', 'pore', 'spot', 'wrinkle']) {
+        const node = analysis?.[key];
+        if (!node || typeof node !== 'object') continue;
+        const levelNum = Number(node.level);
+        if (Number.isFinite(levelNum)) {
+          if (levelNum >= 4) trend.high += 1;
+          else if (levelNum >= 2) trend.medium += 1;
+          else trend.low += 1;
+        }
+        const scoreNum = Number(node.score);
+        if (Number.isFinite(scoreNum)) {
+          trend.scoreSum += scoreNum;
+          trend.scoreCount += 1;
+        }
+      }
+    }
+
+    const toDistribution = (bucket) => {
+      return Array.from(bucket.entries())
+        .map(([label, count]) => ({
+          label,
+          count,
+          percent: totalRecords > 0 ? Number(((count * 100) / totalRecords).toFixed(2)) : 0
+        }))
+        .sort((a, b) => b.count - a.count);
+    };
+
+    const topGoods = buildTopGoodsFromCounts(canonicalTopGoodsCounts, totalRecords, 20);
+
+    const rawTopMultiUseGoods = Array.from(multiUseModules.entries())
+      .filter(([, modules]) => modules.size >= 2)
+      .map(([label, modules]) => ({
+        label,
+        count: multiUseRecordCounts.get(label) || 0,
+        percent: totalRecords > 0 ? Number((((multiUseRecordCounts.get(label) || 0) * 100) / totalRecords).toFixed(2)) : 0,
+        modules: Array.from(modules).sort()
+      }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 20);
+    const topMultiUseGoods = normalizeTopMultiUseGoods(rawTopMultiUseGoods, totalRecords, 'recommendations');
+
+    const trendTotal = trend.high + trend.medium + trend.low;
+    const issueTrends = {
+      highShare: trendTotal > 0 ? Number(((trend.high * 100) / trendTotal).toFixed(2)) : 0,
+      mediumShare: trendTotal > 0 ? Number(((trend.medium * 100) / trendTotal).toFixed(2)) : 0,
+      lowShare: trendTotal > 0 ? Number(((trend.low * 100) / trendTotal).toFixed(2)) : 0,
+      averageScore: trend.scoreCount > 0 ? Number((trend.scoreSum / trend.scoreCount).toFixed(2)) : null
+    };
+
+    const kpiPlan = [
+      {
+        title: 'Giảm nhóm mức độ nặng',
+        target: `High share <= ${Math.max(0, issueTrends.highShare - 5).toFixed(2)}%`,
+        evidence: `Current highShare=${issueTrends.highShare}%`
+      },
+      {
+        title: 'Nâng điểm trung bình các vấn đề chính',
+        target: issueTrends.averageScore == null ? 'N/A' : `Average score >= ${(issueTrends.averageScore + 5).toFixed(2)}`,
+        evidence: `Current averageScore=${issueTrends.averageScore ?? 'N/A'}`
+      },
+      {
+        title: 'Tăng phủ sản phẩm đa tác dụng',
+        target: `Top multi-use goods >= ${Math.min(10, topMultiUseGoods.length + 2)} items`,
+        evidence: `Current multi-use count=${topMultiUseGoods.length}`
+      }
+    ];
+
+    return res.json({
+      success: true,
+      message: 'OK',
+      meta: {
+        from,
+        to,
+        rangeField,
+        totalRecords,
+        generatedAt: new Date().toISOString()
+      },
+      data: {
+        totalRecords,
+        topMultiUseGoods,
+        topGoods,
+        sensitivity: toDistribution(sensitivityCounts),
+        darkCircleTypes: toDistribution(darkCircleTypeCounts),
+        issueTrends,
+        kpiPlan
+      }
+    });
+  } catch (error) {
+    return sendApiError(res, 500, 'Internal server error', 'INTERNAL_ERROR', error?.message || null);
+  }
+});
+
+/**
+ * GET /api/skin-records
+ * Paginated records for list view.
+ */
+app.get('/api/skin-records', async (req, res) => {
+  const parsed = parseSkinRecordsQuery(req);
+  if (parsed.error) {
+    return sendApiError(res, parsed.error.status, parsed.error.message, parsed.error.code);
+  }
+
+  const { from, to, rangeField, page, pageSize, sortBy, sortOrder } = parsed.value;
+  const search = String(req.query.search || '').trim();
+  const sex = req.query.sex != null ? String(req.query.sex).trim() : '';
+  const account = String(req.query.account || '').trim();
+
+  try {
+    const queryParts = [parseDayRangeQuery(from, to, rangeField)];
+
+    if (search) {
+      queryParts.push({
+        $or: [
+          { id: { $regex: search, $options: 'i' } },
+          { result_id: { $regex: search, $options: 'i' } },
+          { code: { $regex: search, $options: 'i' } },
+          { customer_nickname: { $regex: search, $options: 'i' } },
+          { customer_mobile: { $regex: search, $options: 'i' } },
+          { user_acct: { $regex: search, $options: 'i' } }
+        ]
+      });
+    }
+    if (sex) {
+      const numSex = Number(sex);
+      if (Number.isFinite(numSex)) {
+        queryParts.push({ customer_sex: { $in: [sex, numSex] } });
+      } else {
+        queryParts.push({ customer_sex: sex });
+      }
+    }
+    if (account) {
+      queryParts.push({ user_acct: { $regex: account, $options: 'i' } });
+    }
+
+    const query = queryParts.length === 1 ? queryParts[0] : { $and: queryParts };
+    const projection = {
+      _id: 0,
+      id: 1,
+      result_id: 1,
+      code: 1,
+      status: 1,
+      crt_time: 1,
+      test_time: 1,
+      testTime: 1,
+      createdAt: 1,
+      updatedAt: 1,
+      image: 1,
+      user_acct: 1,
+      customer_nickname: 1,
+      customer_sex: 1,
+      customer_age: 1,
+      customer_mobile: 1,
+      analysis: 1
+    };
+
+    const sort = {};
+    if (sortBy === 'test_time') {
+      sort.test_time = sortOrder;
+      sort.testTime = sortOrder;
+    } else {
+      sort[sortBy] = sortOrder;
+    }
+
+    const skip = (page - 1) * pageSize;
+    const [total, docs] = await Promise.all([
+      Skin.countDocuments(query),
+      Skin.find(query, projection).sort(sort).skip(skip).limit(pageSize).lean()
+    ]);
+
+    return res.json({
+      success: true,
+      message: 'OK',
+      meta: {
+        total,
+        page,
+        pageSize,
+        totalPages: Math.max(1, Math.ceil(total / pageSize)),
+        from,
+        to,
+        rangeField,
+        generatedAt: new Date().toISOString()
+      },
+      data: docs.map(normalizeListRecord)
+    });
+  } catch (error) {
+    return sendApiError(res, 500, 'Internal server error', 'INTERNAL_ERROR', error?.message || null);
+  }
+});
+
+/**
+ * GET /api/skin-records/by-result/:resultId
+ * Detail by result_id.
+ */
+app.get('/api/skin-records/by-result/:resultId', async (req, res) => {
+  const resultId = String(req.params.resultId || '').trim();
+  if (!resultId) {
+    return sendApiError(res, 400, 'Missing resultId', 'INVALID_QUERY');
+  }
+  try {
+    const doc = await Skin.findOne(
+      { result_id: resultId },
+      {
+        _id: 0,
+        id: 1,
+        result_id: 1,
+        code: 1,
+        status: 1,
+        crt_time: 1,
+        test_time: 1,
+        testTime: 1,
+        createdAt: 1,
+        updatedAt: 1,
+        image: 1,
+        user_acct: 1,
+        customer_nickname: 1,
+        customer_sex: 1,
+        customer_age: 1,
+        customer_mobile: 1,
+        recommendedGoodsIds: 1,
+        recommendedGoods: 1,
+        analysis: 1
+      }
+    ).lean();
+    if (!doc) {
+      return sendApiError(res, 404, `Record with result_id=${resultId} not found`, 'NOT_FOUND');
+    }
+    return res.json({
+      success: true,
+      message: 'OK',
+      data: normalizeDetailRecord(doc)
+    });
+  } catch (error) {
+    return sendApiError(res, 500, 'Internal server error', 'INTERNAL_ERROR', error?.message || null);
+  }
+});
+
+/**
+ * GET /api/skin-records/:id
+ * Detail by id.
+ */
+app.get('/api/skin-records/:id', async (req, res) => {
+  const idParam = String(req.params.id || '').trim();
+  if (!idParam) {
+    return sendApiError(res, 400, 'Missing id', 'INVALID_QUERY');
+  }
+  try {
+    const idCandidates = [idParam];
+    const num = Number(idParam);
+    if (Number.isFinite(num)) idCandidates.push(num);
+
+    const doc = await Skin.findOne(
+      { id: { $in: idCandidates } },
+      {
+        _id: 0,
+        id: 1,
+        result_id: 1,
+        code: 1,
+        status: 1,
+        crt_time: 1,
+        test_time: 1,
+        testTime: 1,
+        createdAt: 1,
+        updatedAt: 1,
+        image: 1,
+        user_acct: 1,
+        customer_nickname: 1,
+        customer_sex: 1,
+        customer_age: 1,
+        customer_mobile: 1,
+        recommendedGoodsIds: 1,
+        recommendedGoods: 1,
+        analysis: 1
+      }
+    ).lean();
+    if (!doc) {
+      return sendApiError(res, 404, `Record with id=${idParam} not found`, 'NOT_FOUND');
+    }
+    return res.json({
+      success: true,
+      message: 'OK',
+      data: normalizeDetailRecord(doc)
+    });
+  } catch (error) {
+    return sendApiError(res, 500, 'Internal server error', 'INTERNAL_ERROR', error?.message || null);
+  }
+});
+
+/**
  * GET /api/data/view
  * Stream full set of documents that match the query so the UI can display the exact range.
  */
@@ -1098,11 +2562,10 @@ app.get('/api/data/view', async (req, res) => {
     const sortOrder = req.query.sortOrder === 'asc' ? 1 : -1;
     const inputStart = req.query.start ?? req.query.from ?? req.query.st ?? null;
     const inputEnd = req.query.end ?? req.query.to ?? req.query.ed ?? null;
-    const rangeStart = normalizeDateInput(inputStart, false);
-    const rangeEnd = normalizeDateInput(inputEnd, true);
-    const rangeField = (req.query.rangeField || req.query.field || 'scrapedAt').trim();
-    const allowedFields = ['scrapedAt', 'crt_time'];
-    const normalizedRangeField = allowedFields.includes(rangeField) ? rangeField : 'scrapedAt';
+    let rangeStart = normalizeDateInput(inputStart, false);
+    let rangeEnd = normalizeDateInput(inputEnd, true);
+    const rangeField = req.query.rangeField || req.query.field || DEFAULT_RANGE_FIELD;
+    const normalizedRangeField = normalizeRangeField(rangeField);
     const rangeFilter = buildRangeQuery(rangeStart, rangeEnd, normalizedRangeField);
 
     const search = req.query.search || '';
@@ -1157,7 +2620,7 @@ app.get('/api/data/view', async (req, res) => {
       }
     }
 
-    const effectiveSortField = allowedFields.includes(sortByArg)
+    const effectiveSortField = ALLOWED_RANGE_FIELDS.includes(sortByArg)
       ? sortByArg
       : currentRangeField;
 
@@ -1231,9 +2694,8 @@ app.get('/api/data/stats', async (req, res) => {
     const inputEnd = req.query.end ?? req.query.to ?? null;
     const rangeStart = normalizeDateInput(inputStart, false);
     const rangeEnd = normalizeDateInput(inputEnd, true);
-    const rangeField = (req.query.rangeField || req.query.field || 'scrapedAt').trim();
-    const allowedFields = ['scrapedAt', 'crt_time'];
-    const normalizedRangeField = allowedFields.includes(rangeField) ? rangeField : 'scrapedAt';
+    const rangeField = req.query.rangeField || req.query.field || DEFAULT_RANGE_FIELD;
+    const normalizedRangeField = normalizeRangeField(rangeField);
     const rangeFilter = buildRangeQuery(rangeStart, rangeEnd, normalizedRangeField);
     const baseMatch = rangeFilter ? { $match: rangeFilter } : null;
     const total = await Skin.countDocuments(rangeFilter || {});
@@ -1269,8 +2731,8 @@ app.get('/api/data/stats', async (req, res) => {
         byGender,
         byAccount,
         byStatus,
-        oldestRecord: oldest ? oldest.scrapedAt : null,
-        newestRecord: newest ? newest.scrapedAt : null,
+        oldestRecord: oldest ? oldest[normalizedRangeField] : null,
+        newestRecord: newest ? newest[normalizedRangeField] : null,
         dataTimeRange: displayDataTimeRange,
         lastSync: lastSync
           ? {
@@ -1934,33 +3396,26 @@ async function handleAuthentication(page) {
         );
         return;
       }
-      const latestByCrt = await Skin.findOne({ crt_time: { $gt: '' } })
-        .sort({ crt_time: -1 })
-        .lean();
-      const latestByTest = !latestByCrt
-        ? await Skin.findOne({ testTime: { $gt: '' } }).sort({ testTime: -1 }).lean()
-        : null;
-      const latest = latestByCrt?.crt_time || latestByTest?.testTime || null;
-      const dataTimezone = cfg.sourceTimezone || cfg.syncTimezone || 'Asia/Ho_Chi_Minh';
-      const latestDate = parseDateInTimezone(latest, dataTimezone) || parseDateInput(latest);
-      if (!latestDate || Number.isNaN(latestDate.getTime())) {
+      const incrementalRange = await buildIncrementalSyncRange(now);
+      if (!incrementalRange) {
         console.log('⏭️  Cron sync skipped: no latest record time found to build range');
         return;
       }
-      const rangeStartDate = new Date(latestDate.getTime() + 60 * 1000);
-      const rangeEndDate = new Date();
-      if (rangeStartDate.getTime() > rangeEndDate.getTime()) {
-        const timezone = cfg.syncTimezone || 'Asia/Ho_Chi_Minh';
+      if (incrementalRange.invalid) {
+        const tz = cfg.syncTimezone || 'Asia/Ho_Chi_Minh';
         console.log(
-          `⏭️  Cron sync skipped: computed range is invalid (${formatDateTimeInTimezone(rangeStartDate, timezone)} > ${formatDateTimeInTimezone(rangeEndDate, timezone)}), latest=${latest || 'n/a'}`
+          `⏭️  Cron sync skipped: computed range is invalid (${formatDateTimeInTimezone(incrementalRange.rangeStartDate, tz)} > ${formatDateTimeInTimezone(incrementalRange.rangeEndDate, tz)}), latest=${incrementalRange.anchor?.latestRaw || 'n/a'} (${incrementalRange.anchor?.sourceField || 'unknown'})`
         );
         return;
       }
-      const rangeTimezone = cfg.sourceTimezone || cfg.syncTimezone || 'Asia/Ho_Chi_Minh';
-      const rangeStart = formatDateTimeInTimezone(rangeStartDate, rangeTimezone);
-      const rangeEnd = formatDateTimeInTimezone(rangeEndDate, rangeTimezone);
-      await enqueueSync({ rangeStart, rangeEnd, reason: 'cron' });
-      console.log(`✅ Cron sync enqueued: ${rangeStart} -> ${rangeEnd}`);
+      await enqueueSync({
+        rangeStart: incrementalRange.rangeStart,
+        rangeEnd: incrementalRange.rangeEnd,
+        reason: 'cron'
+      });
+      console.log(
+        `✅ Cron sync enqueued: ${incrementalRange.rangeStart} -> ${incrementalRange.rangeEnd} (anchor=${incrementalRange.anchor?.sourceField || 'unknown'})`
+      );
     }, { timezone: cronTimezone });
     console.log(
       `⏱️  Cron sync scheduled: ${cfg.cron} (window ${cfg.syncWindow.startHour}:00-${cfg.syncWindow.endHour}:00, timezone ${cronTimezone})`
@@ -1978,6 +3433,14 @@ async function handleAuthentication(page) {
     console.log(`   GET  /api/sync/status - Check sync status`);
     console.log(`   POST /api/sync/request - Request background sync`);
     console.log(`   GET  /api/data - Get data (with pagination, search, sort)`);
+    console.log(`   GET  /api/customers - Query customer-focused data`);
+    console.log(`   GET  /api/skin-report/summary - Aggregated dashboard summary`);
+    console.log(`   GET  /api/skin-report/profile - Demographic and skin-type tab data`);
+    console.log(`   GET  /api/skin-report/conditions - Condition tab data`);
+    console.log(`   GET  /api/skin-report/recommendations - Recommendations/KPI tab data`);
+    console.log(`   GET  /api/skin-records - Raw skin records for FE list/detail`);
+    console.log(`   GET  /api/skin-records/:id - Record detail by id`);
+    console.log(`   GET  /api/skin-records/by-result/:resultId - Record detail by result_id`);
     console.log(`   GET  /api/data/stats - Get statistics`);
     console.log(`   GET  /api/data/export?format=json|csv - Export data`);
     console.log(`   DELETE /api/data - Delete data`);

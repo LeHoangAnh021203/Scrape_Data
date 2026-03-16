@@ -1,3 +1,10 @@
 
 # data dumps
 *.gz
+*.json
+
+# dependencies
+node_modules/
+
+# generated data
+dump/
