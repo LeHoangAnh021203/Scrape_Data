@@ -1084,22 +1084,24 @@ app.get('/api/data', async (req, res) => {
       ? {}
       : (queryParts.length === 1 ? queryParts[0] : { $and: queryParts });
 
-    // Get total count
-    const total = await Skin.countDocuments(query);
-
-    // Get data
     const resolvedSortField = ALLOWED_RANGE_FIELDS.includes(sortByArg) ? sortByArg : normalizedRangeField;
     let dataQuery = Skin.find(query).sort({ [resolvedSortField]: sortOrder });
     if (!(unlimitedRequest)) {
       dataQuery = dataQuery.skip(skip).limit(resolvedLimit);
     }
-    const data = await dataQuery.lean();
 
     let syncState = null;
     let syncKey = null;
+    const [total, data, initialSyncState] = await Promise.all([
+      Skin.countDocuments(query),
+      dataQuery.lean(),
+      (rangeStart && rangeEnd)
+        ? SyncState.findOne({ key: rangeKey(rangeStart, rangeEnd) }).lean()
+        : Promise.resolve(null)
+    ]);
     if (rangeStart && rangeEnd) {
       syncKey = rangeKey(rangeStart, rangeEnd);
-      syncState = await SyncState.findOne({ key: syncKey }).lean();
+      syncState = initialSyncState;
       if (shouldTriggerSync(total, syncState, refresh)) {
         syncState = await enqueueSync({
           rangeStart,
@@ -1110,8 +1112,10 @@ app.get('/api/data', async (req, res) => {
       }
     }
 
-    const dataTimeRange = await getDataTimeRange(rangeFilter, normalizedRangeField);
-    const fullDataTimeRange = await getDataTimeRange(null, normalizedRangeField);
+    const [dataTimeRange, fullDataTimeRange] = await Promise.all([
+      getDataTimeRange(rangeFilter, normalizedRangeField),
+      getDataTimeRange(null, normalizedRangeField)
+    ]);
     const missingRange = computeMissingRange(rangeStart, rangeEnd, dataTimeRange);
     if (missingRange) {
       await enqueueSync({
@@ -1234,8 +1238,6 @@ app.get('/api/customers', async (req, res) => {
       ? {}
       : (queryParts.length === 1 ? queryParts[0] : { $and: queryParts });
 
-    const total = await Skin.countDocuments(query);
-
     const sortableFields = new Set([
       'customer_nickname',
       'customer_mobile',
@@ -1303,7 +1305,11 @@ app.get('/api/customers', async (req, res) => {
     if (!unlimitedRequest) {
       dataQuery = dataQuery.skip(skip).limit(resolvedLimit);
     }
-    const docs = await dataQuery.lean();
+    const [total, docs, dataTimeRange] = await Promise.all([
+      Skin.countDocuments(query),
+      dataQuery.lean(),
+      getDataTimeRange(rangeFilter, normalizedRangeField)
+    ]);
 
     const pickSkinMetric = (node) => {
       if (!node || typeof node !== 'object') return null;
@@ -1394,7 +1400,6 @@ app.get('/api/customers', async (req, res) => {
       };
     });
 
-    const dataTimeRange = await getDataTimeRange(rangeFilter, normalizedRangeField);
     const displayDataTimeRange = formatDataRangeForDisplay(dataTimeRange);
 
     return res.json({
@@ -1451,8 +1456,11 @@ const SKIN_SORT_FIELDS = new Set([
   'customer_age',
   'user_acct'
 ]);
-const SUMMARY_CACHE_TTL_MS = Math.max(30000, Number(process.env.SUMMARY_CACHE_TTL_MS || 60000));
-const skinSummaryCache = new Map();
+const REPORT_CACHE_TTL_MS = Math.max(
+  30000,
+  Number(process.env.REPORT_CACHE_TTL_MS || process.env.SUMMARY_CACHE_TTL_MS || 60000)
+);
+const skinReportCache = new Map();
 
 const sendApiError = (res, status, message, errorCode, details = null) => {
   return res.status(status).json({
@@ -1592,7 +1600,11 @@ const buildModuleGoodsMap = (analysis) => {
   const safeAnalysis = (analysis && typeof analysis === 'object') ? analysis : {};
   const moduleGoodsMap = new Map();
   for (const moduleKey of MULTI_USE_MODULE_KEYS) {
-    const goodsSet = new Set(toGoodsIdList(safeAnalysis?.[moduleKey]?.goods));
+    const moduleNode = safeAnalysis?.[moduleKey];
+    const goodsSource = (moduleNode && typeof moduleNode === 'object' && !Array.isArray(moduleNode))
+      ? moduleNode.goods
+      : moduleNode;
+    const goodsSet = new Set(toGoodsIdList(goodsSource));
     if (goodsSet.size > 0) {
       moduleGoodsMap.set(moduleKey, goodsSet);
     }
@@ -1656,6 +1668,96 @@ const normalizeTopMultiUseGoods = (items, totalRecords, contextLabel = 'unknown'
     .filter(Boolean);
 };
 
+const SUMMARY_MULTI_USE_GOODS_FIELDS = {
+  skin_type: '$analysis.skin_type.goods',
+  ext_water: '$analysis.ext_water.goods',
+  pore: '$analysis.pore.goods',
+  spot: '$analysis.spot.goods',
+  wrinkle: '$analysis.wrinkle.goods',
+  acne: '$analysis.acne.goods',
+  blackhead: '$analysis.blackhead.goods',
+  dark_circle: '$analysis.dark_circle.goods',
+  collagen: '$analysis.collagen.goods',
+  pockmark: '$analysis.pockmark.goods',
+  uv_spot: '$analysis.uv_spot.goods'
+};
+
+const buildSummaryProjectionPipeline = (rangeQuery) => ([
+  { $match: rangeQuery },
+  {
+    $project: {
+      _id: 0,
+      customer_sex: '$customer_sex',
+      customer_age: '$customer_age',
+      customer_mobile: '$customer_mobile',
+      predictedAge: { $ifNull: ['$analysis.age.result', '$analysis.final_result.age'] },
+      skinType: { $ifNull: ['$analysis.skin_type.type', '$analysis.final_result.skin_result'] },
+      darkCircleType: '$analysis.dark_circle.type',
+      sensitivityType: '$analysis.sensitive.type',
+      acneLevel: '$analysis.acne.level',
+      poreLevel: '$analysis.pore.level',
+      spotLevel: '$analysis.spot.level',
+      wrinkleLevel: '$analysis.wrinkle.level',
+      finalGoods: '$analysis.final_result.goods',
+      moduleGoods: SUMMARY_MULTI_USE_GOODS_FIELDS
+    }
+  }
+]);
+
+const buildProfileProjectionPipeline = (rangeQuery) => ([
+  { $match: rangeQuery },
+  {
+    $project: {
+      _id: 0,
+      customer_sex: '$customer_sex',
+      customer_age: '$customer_age',
+      predictedAge: { $ifNull: ['$analysis.age.result', '$analysis.final_result.age'] },
+      skinType: { $ifNull: ['$analysis.skin_type.type', '$analysis.final_result.skin_result'] }
+    }
+  }
+]);
+
+const buildConditionsProjectionPipeline = (rangeQuery) => ([
+  { $match: rangeQuery },
+  {
+    $project: {
+      _id: 0,
+      customer_sex: '$customer_sex',
+      acne: '$analysis.acne',
+      pore: '$analysis.pore',
+      spot: '$analysis.spot',
+      wrinkle: '$analysis.wrinkle',
+      blackhead: '$analysis.blackhead',
+      dark_circle: '$analysis.dark_circle',
+      collagen: '$analysis.collagen',
+      pockmark: '$analysis.pockmark',
+      uv_spot: '$analysis.uv_spot',
+      ext_water: '$analysis.ext_water'
+    }
+  }
+]);
+
+const buildRecommendationsProjectionPipeline = (rangeQuery) => ([
+  { $match: rangeQuery },
+  {
+    $project: {
+      _id: 0,
+      sensitivityType: '$analysis.sensitive.type',
+      darkCircleType: '$analysis.dark_circle.type',
+      finalGoods: '$analysis.final_result.goods',
+      moduleGoods: SUMMARY_MULTI_USE_GOODS_FIELDS,
+      acneLevel: '$analysis.acne.level',
+      acneScore: '$analysis.acne.score',
+      poreLevel: '$analysis.pore.level',
+      poreScore: '$analysis.pore.score',
+      spotLevel: '$analysis.spot.level',
+      spotScore: '$analysis.spot.score',
+      wrinkleLevel: '$analysis.wrinkle.level',
+      wrinkleScore: '$analysis.wrinkle.score'
+    }
+  }
+]);
+
 const normalizeListRecord = (doc) => {
   const analysis = (doc.analysis && typeof doc.analysis === 'object') ? doc.analysis : {};
   return {
@@ -1708,20 +1810,22 @@ const normalizeDetailRecord = (doc) => {
   };
 };
 
-const getSummaryCache = (key) => {
-  const cached = skinSummaryCache.get(key);
+const buildReportCacheKey = (scope, payload) => JSON.stringify({ scope, ...payload });
+
+const getReportCache = (key) => {
+  const cached = skinReportCache.get(key);
   if (!cached) return null;
   if (cached.expiresAt <= Date.now()) {
-    skinSummaryCache.delete(key);
+    skinReportCache.delete(key);
     return null;
   }
   return cached.payload;
 };
 
-const setSummaryCache = (key, payload) => {
-  skinSummaryCache.set(key, {
+const setReportCache = (key, payload) => {
+  skinReportCache.set(key, {
     payload,
-    expiresAt: Date.now() + SUMMARY_CACHE_TTL_MS
+    expiresAt: Date.now() + REPORT_CACHE_TTL_MS
   });
 };
 
@@ -1737,22 +1841,14 @@ app.get('/api/skin-report/summary', async (req, res) => {
   const { from, to, rangeField } = parsed.value;
 
   try {
-    const cacheKey = JSON.stringify({ from, to, rangeField });
-    const cached = getSummaryCache(cacheKey);
+    const cacheKey = buildReportCacheKey('summary', { from, to, rangeField });
+    const cached = getReportCache(cacheKey);
     if (cached) {
       return res.json(cached);
     }
 
     const rangeQuery = parseDayRangeQuery(from, to, rangeField);
-    const projection = {
-      customer_sex: 1,
-      customer_age: 1,
-      customer_mobile: 1,
-      analysis: 1,
-      recommendedGoodsIds: 1
-    };
-
-    const docs = await Skin.find(rangeQuery, projection).lean();
+    const docs = await Skin.aggregate(buildSummaryProjectionPipeline(rangeQuery)).allowDiskUse(true);
     const totalRecords = docs.length;
 
     const ageValues = [];
@@ -1789,10 +1885,10 @@ app.get('/api/skin-report/summary', async (req, res) => {
       bucket.set(key, (bucket.get(key) || 0) + inc);
     };
     for (const doc of docs) {
-      const analysis = (doc.analysis && typeof doc.analysis === 'object') ? doc.analysis : {};
-      const canonicalGoods = new Set(toGoodsIdList(analysis?.final_result?.goods));
+      const moduleGoods = (doc.moduleGoods && typeof doc.moduleGoods === 'object') ? doc.moduleGoods : {};
+      const canonicalGoods = new Set(toGoodsIdList(doc.finalGoods));
       const reportedAge = toNumber(doc.customer_age);
-      const predictedAge = toNumber(analysis?.age?.result ?? analysis?.final_result?.age);
+      const predictedAge = toNumber(doc.predictedAge);
       const chosenAge = predictedAge ?? reportedAge;
 
       if (reportedAge != null) {
@@ -1817,15 +1913,15 @@ app.get('/api/skin-report/summary', async (req, res) => {
       }
 
       addCount(sexCounts, doc.customer_sex ?? 'unknown');
-      addCount(skinTypeCounts, analysis?.skin_type?.type ?? analysis?.final_result?.skin_result ?? 'unknown');
-      addCount(darkCircleTypeCounts, analysis?.dark_circle?.type ?? 'unknown');
-      addCount(sensitivityCounts, analysis?.sensitive?.type ?? 'unknown');
-      addMultiUseStatsFromRecord(analysis, multiUseRecordCounts, multiUseModules);
+      addCount(skinTypeCounts, doc.skinType ?? 'unknown');
+      addCount(darkCircleTypeCounts, doc.darkCircleType ?? 'unknown');
+      addCount(sensitivityCounts, doc.sensitivityType ?? 'unknown');
+      addMultiUseStatsFromRecord(moduleGoods, multiUseRecordCounts, multiUseModules);
 
-      for (const key of ['acne', 'pore', 'spot', 'wrinkle']) {
-        const level = analysis?.[key]?.level ?? 'unknown';
-        addCount(severityCounters[key], level);
-      }
+      addCount(severityCounters.acne, doc.acneLevel ?? 'unknown');
+      addCount(severityCounters.pore, doc.poreLevel ?? 'unknown');
+      addCount(severityCounters.spot, doc.spotLevel ?? 'unknown');
+      addCount(severityCounters.wrinkle, doc.wrinkleLevel ?? 'unknown');
       for (const gid of canonicalGoods) {
         canonicalTopGoodsCounts.set(gid, (canonicalTopGoodsCounts.get(gid) || 0) + 1);
       }
@@ -1920,7 +2016,7 @@ app.get('/api/skin-report/summary', async (req, res) => {
       }
     };
 
-    setSummaryCache(cacheKey, response);
+    setReportCache(cacheKey, response);
     return res.json(response);
   } catch (error) {
     return sendApiError(res, 500, 'Internal server error', 'INTERNAL_ERROR', error?.message || null);
@@ -1939,15 +2035,14 @@ app.get('/api/skin-report/profile', async (req, res) => {
   const { from, to, rangeField } = parsed.value;
 
   try {
-    const docs = await Skin.find(
-      parseDayRangeQuery(from, to, rangeField),
-      {
-        _id: 0,
-        customer_sex: 1,
-        customer_age: 1,
-        analysis: 1
-      }
-    ).lean();
+    const cacheKey = buildReportCacheKey('profile', { from, to, rangeField });
+    const cached = getReportCache(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    const docs = await Skin.aggregate(buildProfileProjectionPipeline(parseDayRangeQuery(from, to, rangeField)))
+      .allowDiskUse(true);
 
     const totalRecords = docs.length;
     const sexCounts = new Map();
@@ -1981,11 +2076,10 @@ app.get('/api/skin-report/profile', async (req, res) => {
     };
 
     for (const doc of docs) {
-      const analysis = (doc.analysis && typeof doc.analysis === 'object') ? doc.analysis : {};
       addCount(sexCounts, doc.customer_sex ?? 'unknown');
-      addCount(skinTypeCounts, analysis?.skin_type?.type ?? analysis?.final_result?.skin_result ?? 'unknown');
+      addCount(skinTypeCounts, doc.skinType ?? 'unknown');
 
-      const predictedAge = toNumber(analysis?.age?.result ?? analysis?.final_result?.age);
+      const predictedAge = toNumber(doc.predictedAge);
       const reportedAge = toNumber(doc.customer_age);
       const age = predictedAge ?? reportedAge;
       if (age == null) {
@@ -2005,7 +2099,7 @@ app.get('/api/skin-report/profile', async (req, res) => {
       }
     }
 
-    return res.json({
+    const response = {
       success: true,
       message: 'OK',
       meta: {
@@ -2020,7 +2114,9 @@ app.get('/api/skin-report/profile', async (req, res) => {
         skinTypes: asDistribution(skinTypeCounts),
         ageBuckets: asDistribution(ageBuckets)
       }
-    });
+    };
+    setReportCache(cacheKey, response);
+    return res.json(response);
   } catch (error) {
     return sendApiError(res, 500, 'Internal server error', 'INTERNAL_ERROR', error?.message || null);
   }
@@ -2038,14 +2134,14 @@ app.get('/api/skin-report/conditions', async (req, res) => {
   const { from, to, rangeField } = parsed.value;
 
   try {
-    const docs = await Skin.find(
-      parseDayRangeQuery(from, to, rangeField),
-      {
-        _id: 0,
-        customer_sex: 1,
-        analysis: 1
-      }
-    ).lean();
+    const cacheKey = buildReportCacheKey('conditions', { from, to, rangeField });
+    const cached = getReportCache(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    const docs = await Skin.aggregate(buildConditionsProjectionPipeline(parseDayRangeQuery(from, to, rangeField)))
+      .allowDiskUse(true);
     const totalRecords = docs.length;
 
     const mainSeverityKeys = ['acne', 'pore', 'spot', 'wrinkle'];
@@ -2092,7 +2188,6 @@ app.get('/api/skin-report/conditions', async (req, res) => {
     }
 
     for (const doc of docs) {
-      const analysis = (doc.analysis && typeof doc.analysis === 'object') ? doc.analysis : {};
       const sex = Number(doc.customer_sex);
       const isMale = sex === 1;
       const isFemale = sex === 2;
@@ -2100,7 +2195,7 @@ app.get('/api/skin-report/conditions', async (req, res) => {
       if (isFemale) genderTotals.female += 1;
 
       for (const key of issueKeys) {
-        const node = analysis?.[key];
+        const node = doc?.[key];
         if (!node || typeof node !== 'object') continue;
         issueOccurrence[key].appearCount += 1;
         if (isMale) issueOccurrence[key].maleCount += 1;
@@ -2126,7 +2221,7 @@ app.get('/api/skin-report/conditions', async (req, res) => {
         }
       }
 
-      const extNode = analysis?.ext_water;
+      const extNode = doc?.ext_water;
       if (extNode && typeof extNode === 'object') {
         extWaterOccurrence.appearCount += 1;
         if (isMale) extWaterOccurrence.maleCount += 1;
@@ -2194,7 +2289,7 @@ app.get('/api/skin-report/conditions', async (req, res) => {
     };
     issueOccurrence.ext_water = extWaterOccurrence;
 
-    return res.json({
+    const response = {
       success: true,
       message: 'OK',
       meta: {
@@ -2214,7 +2309,9 @@ app.get('/api/skin-report/conditions', async (req, res) => {
         issueOccurrence,
         genderTotals
       }
-    });
+    };
+    setReportCache(cacheKey, response);
+    return res.json(response);
   } catch (error) {
     return sendApiError(res, 500, 'Internal server error', 'INTERNAL_ERROR', error?.message || null);
   }
@@ -2232,14 +2329,14 @@ app.get('/api/skin-report/recommendations', async (req, res) => {
   const { from, to, rangeField } = parsed.value;
 
   try {
-    const docs = await Skin.find(
-      parseDayRangeQuery(from, to, rangeField),
-      {
-        _id: 0,
-        analysis: 1,
-        recommendedGoodsIds: 1
-      }
-    ).lean();
+    const cacheKey = buildReportCacheKey('recommendations', { from, to, rangeField });
+    const cached = getReportCache(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    const docs = await Skin.aggregate(buildRecommendationsProjectionPipeline(parseDayRangeQuery(from, to, rangeField)))
+      .allowDiskUse(true);
 
     const totalRecords = docs.length;
     const multiUseRecordCounts = new Map();
@@ -2254,26 +2351,23 @@ app.get('/api/skin-report/recommendations', async (req, res) => {
       bucket.set(label, (bucket.get(label) || 0) + 1);
     };
     for (const doc of docs) {
-      const analysis = (doc.analysis && typeof doc.analysis === 'object') ? doc.analysis : {};
-      const canonicalGoods = new Set(toGoodsIdList(analysis?.final_result?.goods));
-      addCount(sensitivityCounts, analysis?.sensitive?.type ?? 'unknown');
-      addCount(darkCircleTypeCounts, analysis?.dark_circle?.type ?? 'unknown');
-      addMultiUseStatsFromRecord(analysis, multiUseRecordCounts, multiUseModules);
+      const canonicalGoods = new Set(toGoodsIdList(doc.finalGoods));
+      addCount(sensitivityCounts, doc.sensitivityType ?? 'unknown');
+      addCount(darkCircleTypeCounts, doc.darkCircleType ?? 'unknown');
+      addMultiUseStatsFromRecord(doc.moduleGoods, multiUseRecordCounts, multiUseModules);
 
       for (const gid of canonicalGoods) {
         canonicalTopGoodsCounts.set(gid, (canonicalTopGoodsCounts.get(gid) || 0) + 1);
       }
 
       for (const key of ['acne', 'pore', 'spot', 'wrinkle']) {
-        const node = analysis?.[key];
-        if (!node || typeof node !== 'object') continue;
-        const levelNum = Number(node.level);
+        const levelNum = Number(doc[`${key}Level`]);
         if (Number.isFinite(levelNum)) {
           if (levelNum >= 4) trend.high += 1;
           else if (levelNum >= 2) trend.medium += 1;
           else trend.low += 1;
         }
-        const scoreNum = Number(node.score);
+        const scoreNum = Number(doc[`${key}Score`]);
         if (Number.isFinite(scoreNum)) {
           trend.scoreSum += scoreNum;
           trend.scoreCount += 1;
@@ -2331,7 +2425,7 @@ app.get('/api/skin-report/recommendations', async (req, res) => {
       }
     ];
 
-    return res.json({
+    const response = {
       success: true,
       message: 'OK',
       meta: {
@@ -2350,7 +2444,9 @@ app.get('/api/skin-report/recommendations', async (req, res) => {
         issueTrends,
         kpiPlan
       }
-    });
+    };
+    setReportCache(cacheKey, response);
+    return res.json(response);
   } catch (error) {
     return sendApiError(res, 500, 'Internal server error', 'INTERNAL_ERROR', error?.message || null);
   }
@@ -2416,7 +2512,8 @@ app.get('/api/skin-records', async (req, res) => {
       customer_sex: 1,
       customer_age: 1,
       customer_mobile: 1,
-      analysis: 1
+      'analysis.age': 1,
+      'analysis.final_result': 1
     };
 
     const sort = {};
@@ -2697,34 +2794,51 @@ app.get('/api/data/stats', async (req, res) => {
     const rangeField = req.query.rangeField || req.query.field || DEFAULT_RANGE_FIELD;
     const normalizedRangeField = normalizeRangeField(rangeField);
     const rangeFilter = buildRangeQuery(rangeStart, rangeEnd, normalizedRangeField);
+    const cacheKey = buildReportCacheKey('data-stats', {
+      start: rangeStart || null,
+      end: rangeEnd || null,
+      rangeField: normalizedRangeField
+    });
+    const cached = getReportCache(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
     const baseMatch = rangeFilter ? { $match: rangeFilter } : null;
-    const total = await Skin.countDocuments(rangeFilter || {});
-    const byGender = await Skin.aggregate([
-      ...(baseMatch ? [baseMatch] : []),
-      { $group: { _id: '$gender', count: { $sum: 1 } } },
-      { $sort: { count: -1 } }
+    const [
+      total,
+      byGender,
+      byAccount,
+      byStatus,
+      oldest,
+      newest,
+      dataTimeRange,
+      lastSync
+    ] = await Promise.all([
+      Skin.countDocuments(rangeFilter || {}),
+      Skin.aggregate([
+        ...(baseMatch ? [baseMatch] : []),
+        { $group: { _id: '$gender', count: { $sum: 1 } } },
+        { $sort: { count: -1 } }
+      ]),
+      Skin.aggregate([
+        ...(baseMatch ? [baseMatch] : []),
+        { $group: { _id: '$account', count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+        { $limit: 10 }
+      ]),
+      Skin.aggregate([
+        ...(baseMatch ? [baseMatch] : []),
+        { $group: { _id: '$testStatus', count: { $sum: 1 } } },
+        { $sort: { count: -1 } }
+      ]),
+      Skin.findOne(rangeFilter || {}).sort({ [normalizedRangeField]: 1 }).lean(),
+      Skin.findOne(rangeFilter || {}).sort({ [normalizedRangeField]: -1 }).lean(),
+      getDataTimeRange(rangeFilter, normalizedRangeField),
+      SyncState.findOne({ status: 'success' }).sort({ lastSuccessAt: -1 }).lean()
     ]);
-    const byAccount = await Skin.aggregate([
-      ...(baseMatch ? [baseMatch] : []),
-      { $group: { _id: '$account', count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-      { $limit: 10 }
-    ]);
-    const byStatus = await Skin.aggregate([
-      ...(baseMatch ? [baseMatch] : []),
-      { $group: { _id: '$testStatus', count: { $sum: 1 } } },
-      { $sort: { count: -1 } }
-    ]);
-
-    const oldest = await Skin.findOne(rangeFilter || {}).sort({ [normalizedRangeField]: 1 }).lean();
-    const newest = await Skin.findOne(rangeFilter || {}).sort({ [normalizedRangeField]: -1 }).lean();
-    const dataTimeRange = await getDataTimeRange(rangeFilter, normalizedRangeField);
     const displayDataTimeRange = formatDataRangeForDisplay(dataTimeRange);
-    const lastSync = await SyncState.findOne({ status: 'success' })
-      .sort({ lastSuccessAt: -1 })
-      .lean();
 
-    res.json({
+    const response = {
       success: true,
       stats: {
         total,
@@ -2744,7 +2858,9 @@ app.get('/api/data/stats', async (req, res) => {
             }
           : null
       }
-    });
+    };
+    setReportCache(cacheKey, response);
+    res.json(response);
   } catch (error) {
     res.status(500).json({
       success: false,
@@ -2785,18 +2901,35 @@ app.get('/api/data/export', async (req, res) => {
       ? {}
       : (queryParts.length === 1 ? queryParts[0] : { $and: queryParts });
 
-    const data = await Skin.find(query).lean();
     const timestamp = new Date().toISOString().split('T')[0];
 
     if (format === 'csv') {
-      if (data.length === 0) {
+      const total = await Skin.countDocuments(query);
+      if (total === 0) {
         return res.status(404).json({ message: 'No data to export' });
       }
 
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="skin-data-${timestamp}.csv"`);
       const headers = ['ID', 'Customer Info', 'Gender', 'Device Number', 'Account', 'Test Time', 'Test Status', 'Remarks', 'Image', 'URL'];
-      const csvRows = [
-        headers.join(','),
-        ...data.map(item => [
+      res.write(`${headers.join(',')}\n`);
+
+      const projection = {
+        _id: 0,
+        id: 1,
+        customerInfo: 1,
+        gender: 1,
+        deviceNumber: 1,
+        account: 1,
+        testTime: 1,
+        testStatus: 1,
+        remarks: 1,
+        image: 1,
+        url: 1
+      };
+      const cursor = Skin.find(query, projection).lean().cursor();
+      for await (const item of cursor) {
+        const row = [
           item.id || '',
           `"${(item.customerInfo || '').replace(/"/g, '""')}"`,
           item.gender || '',
@@ -2807,12 +2940,12 @@ app.get('/api/data/export', async (req, res) => {
           `"${(item.remarks || '').replace(/"/g, '""')}"`,
           item.image || '',
           item.url || ''
-        ].join(','))
-      ];
-
-      res.setHeader('Content-Type', 'text/csv');
-      res.setHeader('Content-Disposition', `attachment; filename="skin-data-${timestamp}.csv"`);
-      res.send(csvRows.join('\n'));
+        ].join(',');
+        if (!res.write(`${row}\n`)) {
+          await once(res, 'drain');
+        }
+      }
+      res.end();
     } else {
       res.setHeader('Content-Type', 'application/json');
       res.setHeader('Content-Disposition', `attachment; filename="skin-data-${timestamp}.json"`);

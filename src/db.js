@@ -63,10 +63,22 @@ const SkinSchema = new mongoose.Schema(
 SkinSchema.index({ result_id: 1 });
 SkinSchema.index({ id: 1 });
 SkinSchema.index({ customer_mobile: 1 });
+SkinSchema.index({ user_acct: 1 });
+SkinSchema.index({ account: 1 });
+SkinSchema.index({ customer_sex: 1 });
 SkinSchema.index({ crt_time: -1 });
+SkinSchema.index({ scrapedAt: -1 });
 SkinSchema.index({ createdAt: -1 });
+SkinSchema.index({ updatedAt: -1 });
 SkinSchema.index({ test_time: -1 });
 SkinSchema.index({ testTime: -1 });
+SkinSchema.index({ crt_time: -1, result_id: 1 });
+SkinSchema.index({ scrapedAt: -1, result_id: 1 });
+SkinSchema.index({ createdAt: -1, result_id: 1 });
+SkinSchema.index({ customer_sex: 1, crt_time: -1 });
+SkinSchema.index({ customer_sex: 1, createdAt: -1 });
+SkinSchema.index({ user_acct: 1, crt_time: -1 });
+SkinSchema.index({ account: 1, crt_time: -1 });
 
 // Create an idempotency key from the most stable fields
 SkinSchema.statics.keyFor = function (doc) {
@@ -96,5 +108,8 @@ const SyncStateSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+SyncStateSchema.index({ status: 1, lastSuccessAt: -1 });
+SyncStateSchema.index({ updatedAt: -1 });
 
 export const SyncState = mongoose.model('SyncState', SyncStateSchema);
